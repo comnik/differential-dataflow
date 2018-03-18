@@ -117,53 +117,112 @@ extern crate lazy_static;
 use stdweb::js_export;
 
 use std::hash::Hash;
+
 use lattice::Lattice;
 use timely::{Root, Allocator};
-use timely::progress::timestamp::RootTimestamp;
 use timely::dataflow::*;
 use timely::dataflow::operators::*;
 use timely::dataflow::operators::input::Handle;
 use timely::dataflow::channels::pact::Pipeline;
 use timely::execute::{setup_threadless};
 
-type Datom = u32;//(u64, u32, u64);
-
 const ATTR_EVENT_TYPE: u32 = 0;
 
-// This takes a potentially JS-generated description of a dataflow
-// graph and turns it into one that differential can understand.
-fn interpret<G: Scope> (computation: u32) where G::Timestamp: Lattice+Hash+Ord {
+type Datom = u32;//(u64, u32, u64);
+type InputHandle = Handle<u64, Datom>;
 
-    let mut results = (0 .. 9).to_stream();
+pub struct Context {
+    root: Root<Allocator>,
+    input_handle: Option<InputHandle>,
+    // output_callbacks,
+}
+
+fn make_context() -> Context {
+    let root = setup_threadless();
+    Context {
+        root,
+        input_handle: None
+    }
+}
+
+static mut CTX: Option<Context> = None;
+
+#[js_export]
+pub fn setup() -> bool {
+    unsafe {
+        CTX = Some(make_context());
+        true
+    }
+}
+
+#[js_export]
+pub fn register(computation: u32) -> bool {
+    unsafe {
+        match CTX {
+            None => false,
+            Some(ref mut ctx) => {
+                let mut input = ctx.root.dataflow::<u64,_,_>(|scope| {
+                    let (datoms_in, datoms) = scope.new_input();
+                    interpret(datoms, computation);
+                    
+                    datoms_in
+                });
+
+                ctx.input_handle = Some(input);
+                
+                true
+            }
+        }
+    }
+}
+
+/// This takes a potentially JS-generated description of a dataflow
+/// graph and turns it into one that differential can understand.
+fn interpret<G: Scope> (datoms: Stream<G, Datom>, computation: u32) where G::Timestamp: Lattice+Hash+Ord {
 
     match computation {
         0 => {
             // [_ :event/type _]
-            results
-                .filter(move |d| d == ATTR_EVENT_TYPE);
+            let stream = datoms
+                .map(|x| x + 1)
+                .sink(Pipeline, "example", |input| {
+                    while let Some((time, data)) = input.next() {
+                        for datum in data.iter() {
+                            js! {
+                                var datum = @{datum};
+                                __UGLY_DIFF_HOOK(datum);
+                            }
+                        }
+                    }
+                });
+
+            // results
+            //     .filter(move |&d| d == ATTR_EVENT_TYPE);
                 // .filter(move |&(e, a, v)| a == ATTR_EVENT_TYPE);
         }
-        // 1 => {
-        //     // [_ :event/type 400]
-        //     results
-        //         .filter(move |&(e, a, v)| a == ATTR_EVENT_TYPE)
-        //         .filter(move |&(e, a, v)| v == 400);
-        // }
+        1 => {
+            // [_ :event/type 400]
+            let stream = datoms
+                .map(|x| x - 1)
+                .sink(Pipeline, "example", |input| {
+                    while let Some((time, data)) = input.next() {
+                        for datum in data.iter() {
+                            js! {
+                                var datum = @{datum};
+                                __UGLY_DIFF_HOOK(datum);
+                            }
+                        }
+                    }
+                });
+
+            // results
+            //     .filter(move |&(e, a, v)| a == ATTR_EVENT_TYPE)
+            //     .filter(move |&(e, a, v)| v == 400);
+        }
         _ => {
             panic!("error: Unknown computation");
         }
     };
-
-    results.sink(Pipeline, "example", |input| {
-        while let Some((time, data)) = input.next() {
-            for datum in data.iter() {
-                js! {
-                    var datum = @{datum};
-                    __UGLY_DIFF_HOOK(datum);
-                }
-            }
-        }
-    });
 }
 
 #[js_export]
@@ -188,37 +247,24 @@ pub fn demo() {
     root.step();
 }
 
-use std::marker;
-use std::rc::Rc;
-use std::cell::RefCell;
-use std::vec::Vec;
-use std::boxed::Box;
-use timely::progress::nested::product::Product;
-use timely::dataflow::channels::Content;
-unsafe impl marker::Sync for Rc<RefCell<Allocator>> {}
-
-lazy_static! {
-    static ref ROOT: Root<Allocator> = { setup_threadless() };
-    static ref DATOMS_IN: Handle<RootTimestamp, Datom> = {
-        let (in_handle, _) = ROOT.new_input();
-        in_handle
-    };
-}
-
 #[js_export]
-pub fn register(computation: u32) {
-    let mut root = setup_threadless();
-    let (datoms_in, datoms) = root.new_input();
-    
-    root.dataflow::<(),_,_>(|scope| {
-        // let datoms_in = scope.new_collection();
-        interpret(datoms_in, computation);
-    });
-}
+pub fn send(tx: u64, d: Datom) -> bool {
+    unsafe {
+        match CTX {
+            None => false,
+            Some(ref mut ctx) => {
+                match ctx.input_handle {
+                    None => false,
+                    Some(ref mut input) => {
+                        input.send(d);
+                        input.advance_to(tx + 1);
+                        
+                        ctx.root.step();
 
-// #[js_export]
-// pub fn send(datoms: Vec<Datom>) {
-//     input.send_batch(datoms);
-//     input.advance_to(tx + 1);
-//     root.step(); // @TODO <- ugh
-// }
+                        true
+                    }
+                }
+            }
+        }
+    }
+}
