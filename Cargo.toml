@@ -13,6 +13,9 @@ repository = "https://github.com/frankmcsherry/differential-dataflow.git"
 keywords = ["differential", "dataflow"]
 license = "MIT"
 
+[lib]
+crate-type = ["cdylib"]
+
 [dev-dependencies]
 getopts="0.2.14"
 rand="0.3.13"
@@ -26,9 +29,11 @@ graph_map = { git = "https://github.com/frankmcsherry/graph-map.git" }
 abomonation = "0.5"
 abomonation_derive = "0.3"
 timely_sort="0.1.6"
-timely_communication = "0.5"
-timely = { git = "https://github.com/frankmcsherry/timely-dataflow" }
+timely_communication = { path = "../timely-dataflow/communication" }
+timely = { path = "../timely-dataflow" }
 fnv="1.0.2"
+stdweb = "0.4.1"
+lazy_static = "1.0"
 
 [profile.release]
 opt-level = 3
