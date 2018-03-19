@@ -248,7 +248,9 @@ pub fn demo() {
 }
 
 #[js_export]
-pub fn send(tx: u64, d: Datom) -> bool {
+pub fn send(tx: u64, d: Vec<Datom>) -> bool {
+    let mut dmut = d.clone();
+    
     unsafe {
         match CTX {
             None => false,
@@ -256,7 +258,7 @@ pub fn send(tx: u64, d: Datom) -> bool {
                 match ctx.input_handle {
                     None => false,
                     Some(ref mut input) => {
-                        input.send(d);
+                        input.send_batch(&mut dmut);
                         input.advance_to(tx + 1);
                         
                         ctx.root.step();
