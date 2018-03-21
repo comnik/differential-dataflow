@@ -121,7 +121,10 @@ use stdweb::js_export;
 use timely::{Root, Allocator};
 use timely::dataflow::scopes::Child;
 use timely::dataflow::operators::*;
+use timely::dataflow::operators::probe::Handle;
 use timely::dataflow::channels::pact::Pipeline;
+use timely::progress::timestamp::RootTimestamp;
+use timely::progress::nested::product::Product;
 use timely::execute::{setup_threadless};
 
 use input::{Input, InputSession};
@@ -130,9 +133,10 @@ use operators::join::JoinCore;
 
 const ATTR_NAME: u32 = 100;
 const ATTR_FRIEND: u32 = 200;
+const ATTR_AGE: u32 = 300; 
 
-const VALUE_NAME_1: u64 = 100;
-const VALUE_NAME_2: u64 = 101;
+const VALUE_NAME_DIPPER: u64 = 100;
+const VALUE_NAME_MABEL: u64 = 101;
 
 // #[derive(Eq, Clone, Serialize, Deserialize, Abomonation, Debug)]
 #[derive(Serialize, Deserialize)]
@@ -167,12 +171,13 @@ js_deserializable!(JsDatom);
 //     }
 // }
 
+type Probe = Handle<Product<RootTimestamp, u64>>;
 type InputHandle = InputSession<u64, Datom, isize>;
-
 
 pub struct Context {
     root: Root<Allocator>,
     input_handle: Option<InputHandle>,
+    probe: Option<Probe>,
     // output_callbacks,
 }
 
@@ -180,7 +185,8 @@ fn make_context() -> Context {
     let root = setup_threadless();
     Context {
         root,
-        input_handle: None
+        input_handle: None,
+        probe: None,
     }
 }
 
@@ -200,14 +206,15 @@ pub fn register(computation: u32) -> bool {
         match CTX {
             None => false,
             Some(ref mut ctx) => {
-                let mut input = ctx.root.dataflow::<u64,_,_>(|mut scope| {
+                let (mut input, mut probe) = ctx.root.dataflow::<u64,_,_>(|mut scope| {
                     let (datoms_in, datoms) = scope.new_collection::<>();
-                    interpret(&mut scope, &datoms, computation);
+                    let probe = interpret(&mut scope, &datoms, computation);
                     
-                    datoms_in
+                    (datoms_in, probe)
                 });
 
                 ctx.input_handle = Some(input);
+                ctx.probe = Some(probe);
                 
                 true
             }
@@ -223,88 +230,60 @@ pub fn register(computation: u32) -> bool {
 /// graph and turns it into one that differential can understand.
 fn interpret<'a> (scope: &mut Child<'a, Root<Allocator>, u64>,
                   datoms: &Collection<Child<'a, Root<Allocator>, u64>, Datom>,
-                  computation: u32) {
+                  computation: u32) -> Probe {
 
+    // TODOS
+    // =====
+    // 
+    // @TODO inspect -> inspect_batch?
+    
     // let eav = datoms.map(|(e, a, v)| (e, (a, v))).arrange_by_key();
     let aev = datoms.map(|(e, a, v)| (a, (e, v))).arrange_by_key();
 
-    let in1 = scope
-        .new_collection_from(vec![ATTR_NAME]).1
-        .arrange_by_self();
+    // [?e :name ?name]
+    let in1 = scope.new_collection_from(vec![ATTR_NAME]).1.arrange_by_self();
+    let r1 = aev.join_core(&in1, |a, &(e, v), _d2| Some((e, v))).arrange_by_key();
 
-    let r1 = aev
-        .join_core(&in1, |a, &(e, v), _d2| Some((e, *a, v)))
+    // [?e :age ?age]
+    let in2 = scope.new_collection_from(vec![ATTR_AGE]).1.arrange_by_self();
+    let r2 = aev.join_core(&in2, |a, &(e, v), _d2| Some((e, v))).arrange_by_key();
+
+    // implicit join
+    let r3 = r2
+        .join_core(&r1, |e, &v1, &v2| Some((*e, v1)))
         .inspect(|res| {
-            let (e, a, v) = res.0;
+            let (e, v) = res.0;
             js! {
-                var datom = @{JsDatom{e, a, v}};
+                var datom = @{JsDatom{e, a: ATTR_NAME, v}};
                 __UGLY_DIFF_HOOK(datom);
             }
-        });
+        })
+        .probe();
 
-    // (join r1 r2)
-    // let r4 = r3
-    //     .map(|d| (d.e, d))
-    //     .join_map(&r1.map(|d| (d.e, d)), |e, &d1, &d2| Datom {e, a: d2.a, v: d2.v})
-    
-    // match computation {
-    //     0 => {
-    //         // [_ :event/type _]
-    //         let stream = datoms
-    //             .map(|d| Datom {v: d.v + 1, ..d} )
-    //             .sink(Pipeline, "example", |input| {
-    //                 while let Some((time, data)) = input.next() {
-    //                     for datom in data.iter() {
-    //                         js! {
-    //                             var datom = @{datom};
-    //                             __UGLY_DIFF_HOOK(datom);
-    //                         }
-    //                     }
-    //                 }
-    //             });
-    //     }
-    //     1 => {
-    //         // [_ :event/type 400]
-    //         let stream = datoms
-    //             .map(|d| Datom {v: d.v - 1, ..d} )
-    //             .sink(Pipeline, "example", |input| {
-    //                 while let Some((time, data)) = input.next() {
-    //                     for datom in data.iter() {
-    //                         js! {
-    //                             var datom = @{datom};
-    //                             __UGLY_DIFF_HOOK(datom);
-    //                         }
-    //                     }
-    //                 }
-    //             });
-    //     }
-    //     _ => {
-    //         panic!("error: Unknown computation");
-    //     }
-    // };
+    r3
 }
 
-#[js_export]
-pub fn demo() {
-    let mut root = setup_threadless();
-    let probe = root.dataflow::<(),_,_>(|scope| {
-        let stream = (0 .. 9)
-            .to_stream(scope)
-            .map(|x| x + 1)
-            .sink(Pipeline, "example", |input| {
-                while let Some((time, data)) = input.next() {
-                    for datum in data.iter() {
-                        js! {
-                            var datum = @{datum};
-                            __UGLY_DIFF_HOOK(datum);
-                        }
-                    }
-                }
-            });
-    });
+// #[js_export]
+// pub fn demo() {
+//     let mut root = setup_threadless();
+//     let probe = root.dataflow::<(),_,_>(|scope| {
+//         let stream = (0 .. 9)
+//             .to_stream(scope)
+//             .map(|x| x + 1)
+//             .sink(Pipeline, "example", |input| {
+//                 while let Some((time, data)) = input.next() {
+//                     for datum in data.iter() {
+//                         js! {
+//                             var datum = @{datum};
+//                             __UGLY_DIFF_HOOK(datum);
+//                         }
+//                     }
+//                 }
+//             });
+//     });
 
-    root.step();
-}
+//     root.step();
+// }
 
 #[js_export]
 pub fn send(tx: u64, d: Vec<JsDatom>) -> bool {
@@ -312,7 +291,6 @@ pub fn send(tx: u64, d: Vec<JsDatom>) -> bool {
         match CTX {
             None => false,
             Some(ref mut ctx) => {
-
                 match ctx.input_handle {
                     None => false,
                     Some(ref mut input) => {
@@ -321,10 +299,17 @@ pub fn send(tx: u64, d: Vec<JsDatom>) -> bool {
                         }
                         input.advance_to(tx + 1);
                         input.flush();
-                        
-                        ctx.root.step();
 
-                        true
+                        match ctx.probe {
+                            None => false,
+                            Some(ref mut probe) => {
+                                while probe.less_than(input.time()) {
+                                    ctx.root.step();
+                                }
+
+                                true
+                            }
+                        }
                     }
                 }
             }

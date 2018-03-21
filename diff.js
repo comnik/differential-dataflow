@@ -1,7 +1,7 @@
 // import diff from "./differential_dataflow.js"
 
 __UGLY_DIFF_HOOK = (datum) => {
-  console.log("yay", datum)
+  console.log('\t=>', datum)
 }
 
 function main () {
