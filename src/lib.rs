@@ -114,12 +114,11 @@ pub mod collection;
 
 use stdweb::js_export;
 
-use std::hash::Hash;
-use std::cmp::Ordering;
+// use std::hash::Hash;
+// use std::cmp::Ordering;
+// use lattice::Lattice;
 
-use lattice::Lattice;
 use timely::{Root, Allocator};
-use timely::dataflow::*;
 use timely::dataflow::scopes::Child;
 use timely::dataflow::operators::*;
 use timely::dataflow::channels::pact::Pipeline;
@@ -203,7 +202,7 @@ pub fn register(computation: u32) -> bool {
             Some(ref mut ctx) => {
                 let mut input = ctx.root.dataflow::<u64,_,_>(|mut scope| {
                     let (datoms_in, datoms) = scope.new_collection::<>();
-                    interpret::<Child<_, _>>(&mut scope, &datoms, computation);
+                    interpret(&mut scope, &datoms, computation);
                     
                     datoms_in
                 });
@@ -222,9 +221,9 @@ pub fn register(computation: u32) -> bool {
 
 /// This takes a potentially JS-generated description of a dataflow
 /// graph and turns it into one that differential can understand.
-fn interpret<'a, G: Scope+Input<'a, Allocator, u64>> (scope: &mut G,
-                                                      datoms: &Collection<G, Datom>,
-                                                      computation: u32) where G::Timestamp: Lattice+Hash+Ord {
+fn interpret<'a> (scope: &mut Child<'a, Root<Allocator>, u64>,
+                  datoms: &Collection<Child<'a, Root<Allocator>, u64>, Datom>,
+                  computation: u32) {
 
     // let eav = datoms.map(|(e, a, v)| (e, (a, v))).arrange_by_key();
     let aev = datoms.map(|(e, a, v)| (a, (e, v))).arrange_by_key();
@@ -234,7 +233,7 @@ fn interpret<'a, G: Scope+Input<'a, Allocator, u64>> (scope: &mut G,
         .arrange_by_self();
 
     let r1 = aev
-        .join_core(&aev, |a, &(e, v), _d2| Some((e, *a, v)))
+        .join_core(&in1, |a, &(e, v), _d2| Some((e, *a, v)))
         .inspect(|res| {
             let (e, a, v) = res.0;
             js! {
