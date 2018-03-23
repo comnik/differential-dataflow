@@ -122,13 +122,14 @@ use timely::{Root, Allocator};
 use timely::dataflow::scopes::Child;
 use timely::dataflow::operators::*;
 use timely::dataflow::operators::probe::Handle;
-use timely::dataflow::channels::pact::Pipeline;
+// use timely::dataflow::channels::pact::Pipeline;
 use timely::progress::timestamp::RootTimestamp;
 use timely::progress::nested::product::Product;
 use timely::execute::{setup_threadless};
 
 use input::{Input, InputSession};
-use operators::arrange::{ArrangeByKey, ArrangeBySelf};
+use trace::{Trace, TraceReader};
+use operators::arrange::{Arrange, ArrangeByKey, ArrangeBySelf};
 use operators::join::JoinCore;
 
 const ATTR_NAME: u32 = 100;
@@ -138,15 +139,23 @@ const ATTR_AGE: u32 = 300;
 const VALUE_NAME_DIPPER: u64 = 100;
 const VALUE_NAME_MABEL: u64 = 101;
 
+//
+// TYPES
+//
+
+type Entity = u64;
+type Attribute = u32;
+type Value = u64; // @TODO enum Value {}
+
 // #[derive(Eq, Clone, Serialize, Deserialize, Abomonation, Debug)]
 #[derive(Serialize, Deserialize)]
 pub struct JsDatom {
-    e: u64,
-    a: u32,
-    v: u64,
+    e: Entity,
+    a: Attribute,
+    v: Value,
 }
 
-type Datom = (u64, u32, u64);
+type Datom = (Entity, Attribute, Value);
 
 js_serializable!(JsDatom);
 js_deserializable!(JsDatom);
@@ -171,13 +180,25 @@ js_deserializable!(JsDatom);
 //     }
 // }
 
+type Scope<'a> = Child<'a, Root<Allocator>, u64>;
 type Probe = Handle<Product<RootTimestamp, u64>>;
 type InputHandle = InputSession<u64, Datom, isize>;
+
+//
+// CONTEXT
+//
+
+type Index<K, V> = Arrange<Scope<'static>, K, V, (K, V), TraceReader<K, V, RootTimestamp, (K, V)>>;
+
+struct DB {
+    e_av: Index<Entity, (Attribute, Value)>,
+}
 
 pub struct Context {
     root: Root<Allocator>,
     input_handle: Option<InputHandle>,
     probe: Option<Probe>,
+    db: Option<DB>,
     // output_callbacks,
 }
 
@@ -187,6 +208,7 @@ fn make_context() -> Context {
         root,
         input_handle: None,
         probe: None,
+        db: None,
     }
 }
 
@@ -213,6 +235,13 @@ pub fn register(computation: u32) -> bool {
                     (datoms_in, probe)
                 });
 
+                ctx.db = Some(DB {
+                    // e_av: datoms.map(|(e, a, v)| (e, (a, v))).arrange_by_key(),
+                    // a_ev: datoms.map(|(e, a, v)| (a, (e, v))).arrange_by_key(),
+                    ea_v: datoms.map(|(e, a, v)| ((e, a), v)).arrange_by_key(),
+                    // av_e: datoms.map(|(e, a, v)| ((a, v), e)).arrange_by_key(),
+                });
+                
                 ctx.input_handle = Some(input);
                 ctx.probe = Some(probe);
                 
@@ -223,8 +252,53 @@ pub fn register(computation: u32) -> bool {
 }
 
 // struct Relation {
-    
+//     in: Vec<u32>,
+//     out: Vec<u32>,
 // }
+
+//
+// QUERY GRAMMAR
+//
+
+struct Var(u32);
+struct Const(Value);
+struct Placeholder;
+
+enum Clause {
+    Lookup(Const, Const, Var),
+    Entity(Const, Var, Var),
+    HasAttr(Var, Const, Var),
+    Filter(Var, Const, Const),
+}
+
+struct Unification { a: Clause, B: Clause, }
+
+//
+// INTERPRETER
+// 
+
+trait Interpretable<T: Arrange> {
+    fn interpret(&self, scope: &mut Scope) -> T;
+}
+
+impl Interpretable for Clause {
+    fn interpret(&self, ctx: &mut Context, scope: &mut Scope) {
+        match self {
+            Clause::Lookup(e, a, v) => {
+                let ea_in = scope.new_collection_from(vec![(e, a)]).1.arrange_by_self();
+                ctx.ea_v.join_core(&ea_in, |&(e, a), v, _| Some(v)).arrange_by_self()
+            },
+            Clause::Pattern(e, a, v) => {
+                let e_in = scope.new_collection_from(vec![e]).1.arrange_by_self();
+                ctx.db.e_av.join_core(&e_in, |e, &(a, v), _| Some((a, v))).arrange_by_key()
+            }
+        }
+    }
+}
+
+// make an input...
+// scope.new_collection_from(vec![v]).1.arrange_by_self(),
+
 
 /// This takes a potentially JS-generated description of a dataflow
 /// graph and turns it into one that differential can understand.
@@ -236,21 +310,24 @@ fn interpret<'a> (scope: &mut Child<'a, Root<Allocator>, u64>,
     // =====
     // 
     // @TODO inspect -> inspect_batch?
+    // @TODO move indicies into Context
+
+    // Given a query...
+    // [?e :name ?name] [?e2 :name ?name]
+    let clause1 = Clause::HasAttr(Var(0), Const(ATTR_NAME), Var(1));
+    let clause2 = Clause::HasAttr(Var(2), Const(ATTR_NAME), Var(1));
+
+    // We notice that two clauses share the same symbol, therfore we
+    // must unify them.
+    let unified = Unification { a: clause1, b: clause2 };
     
-    // let eav = datoms.map(|(e, a, v)| (e, (a, v))).arrange_by_key();
-    let aev = datoms.map(|(e, a, v)| (a, (e, v))).arrange_by_key();
-
-    // [?e :name ?name]
-    let in1 = scope.new_collection_from(vec![ATTR_NAME]).1.arrange_by_self();
-    let r1 = aev.join_core(&in1, |a, &(e, v), _d2| Some((e, v))).arrange_by_key();
-
-    // [?e :age ?age]
-    let in2 = scope.new_collection_from(vec![ATTR_AGE]).1.arrange_by_self();
-    let r2 = aev.join_core(&in2, |a, &(e, v), _d2| Some((e, v))).arrange_by_key();
+    let r1 = clause1.interpret();
+    let r2 = clause2.interpret();
 
     // implicit join
-    let r3 = r2
-        .join_core(&r1, |e, &v1, &v2| Some((*e, v1)))
+    // let r3 = r2.join_core(&r1, |e, &v1, &v2| Some((*e, v1)))
+    
+    let probe = r2
         .inspect(|res| {
             let (e, v) = res.0;
             js! {
@@ -260,7 +337,7 @@ fn interpret<'a> (scope: &mut Child<'a, Root<Allocator>, u64>,
         })
         .probe();
 
-    r3
+    probe
 }
 
 // #[js_export]
