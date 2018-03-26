@@ -114,6 +114,7 @@ pub mod collection;
 
 use stdweb::js_export;
 
+use std::rc::Rc;
 // use std::hash::Hash;
 // use std::cmp::Ordering;
 // use lattice::Lattice;
@@ -128,8 +129,10 @@ use timely::progress::nested::product::Product;
 use timely::execute::{setup_threadless};
 
 use input::{Input, InputSession};
-use trace::{Trace, TraceReader};
-use operators::arrange::{Arrange, ArrangeByKey, ArrangeBySelf};
+use trace::{Trace};
+use trace::implementations::ord::OrdValBatch;
+use trace::implementations::spine::Spine;
+use operators::arrange::{Arranged, ArrangeByKey, ArrangeBySelf, TraceAgent};
 use operators::join::JoinCore;
 
 const ATTR_NAME: u32 = 100;
@@ -145,7 +148,16 @@ const VALUE_NAME_MABEL: u64 = 101;
 
 type Entity = u64;
 type Attribute = u32;
-type Value = u64; // @TODO enum Value {}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Abomonation, Debug, Serialize, Deserialize)]
+enum Value {
+    Eid(Entity),
+    Attribute(Attribute),
+    Number(i64),
+}
+
+js_serializable!(Value);
+js_deserializable!(Value);
 
 // #[derive(Eq, Clone, Serialize, Deserialize, Abomonation, Debug)]
 #[derive(Serialize, Deserialize)]
@@ -180,18 +192,27 @@ js_deserializable!(JsDatom);
 //     }
 // }
 
-type Scope<'a> = Child<'a, Root<Allocator>, u64>;
-type Probe = Handle<Product<RootTimestamp, u64>>;
-type InputHandle = InputSession<u64, Datom, isize>;
+type Scope<'a> = Child<'a, Root<Allocator>, usize>;
+type RootTime = Product<RootTimestamp, usize>;
+type Probe = Handle<RootTime>;
+type InputHandle = InputSession<usize, Datom, isize>;
+// type TraceBatch = OrdValBatch<usize, usize, RootTime, isize>;
+// type TraceSpine = Spine<usize, usize, RootTime, isize, Rc<TraceBatch>>;
+// type TraceHandle = TraceAgent<usize, usize, RootTime, isize, TraceSpine>;
+type Index<'a, K, V> = Arranged<Scope<'a>, K, V, isize,
+                                TraceAgent<K, V, RootTime, isize,
+                                           Spine<K, V, RootTime, isize,
+                                                 Rc<OrdValBatch<K, V, RootTime, isize>>>>>;
 
 //
 // CONTEXT
 //
 
-type Index<K, V> = Arrange<Scope<'static>, K, V, (K, V), TraceReader<K, V, RootTimestamp, (K, V)>>;
-
 struct DB {
-    e_av: Index<Entity, (Attribute, Value)>,
+    e_av: Index<'static, Entity, (Attribute, Value)>,
+    a_ev: Index<'static, Attribute, (Entity, Value)>,
+    ea_v: Index<'static, (Entity, Attribute), Value>,
+    av_e: Index<'static, (Attribute, Value), Entity>,
 }
 
 pub struct Context {
@@ -222,24 +243,24 @@ pub fn setup() -> bool {
     }
 }
 
-#[js_export]
+// #[js_export]
 pub fn register(computation: u32) -> bool {
     unsafe {
         match CTX {
             None => false,
             Some(ref mut ctx) => {
-                let (mut input, mut probe) = ctx.root.dataflow::<u64,_,_>(|mut scope| {
+                let (mut input, mut datoms, mut probe) = ctx.root.dataflow::<usize,_,_>(|mut scope| {
                     let (datoms_in, datoms) = scope.new_collection::<>();
-                    let probe = interpret(&mut scope, &datoms, computation);
+                    let probe = parse_graph(ctx, &mut scope, &datoms, computation);
                     
-                    (datoms_in, probe)
+                    (datoms_in, datoms, probe)
                 });
 
                 ctx.db = Some(DB {
-                    // e_av: datoms.map(|(e, a, v)| (e, (a, v))).arrange_by_key(),
-                    // a_ev: datoms.map(|(e, a, v)| (a, (e, v))).arrange_by_key(),
+                    e_av: datoms.map(|(e, a, v)| (e, (a, v))).arrange_by_key(),
+                    a_ev: datoms.map(|(e, a, v)| (a, (e, v))).arrange_by_key(),
                     ea_v: datoms.map(|(e, a, v)| ((e, a), v)).arrange_by_key(),
-                    // av_e: datoms.map(|(e, a, v)| ((a, v), e)).arrange_by_key(),
+                    av_e: datoms.map(|(e, a, v)| ((a, v), e)).arrange_by_key(),
                 });
                 
                 ctx.input_handle = Some(input);
@@ -260,41 +281,65 @@ pub fn register(computation: u32) -> bool {
 // QUERY GRAMMAR
 //
 
-struct Var(u32);
-struct Const(Value);
 struct Placeholder;
+struct Var(u32);
+
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Abomonation, Debug)]
+struct Const(Value);
+
+struct LookupPattern(Const, Const, Var);
+struct EntityPattern(Const, Var, Var);
+struct HasAttrPattern(Var, Const, Var);
+struct FilterPattern(Var, Const, Const);
 
 enum Clause {
-    Lookup(Const, Const, Var),
-    Entity(Const, Var, Var),
-    HasAttr(Var, Const, Var),
-    Filter(Var, Const, Const),
+    Lookup(LookupPattern),
+    Entity(EntityPattern),
+    HasAttr(HasAttrPattern),
+    Filter(FilterPattern),
 }
 
-struct Unification { a: Clause, B: Clause, }
+struct Unification { a: Clause, b: Clause, }
 
 //
 // INTERPRETER
 // 
 
-trait Interpretable<T: Arrange> {
-    fn interpret(&self, scope: &mut Scope) -> T;
+trait Interpretable<T> {
+    fn interpret(&self, ctx: &mut Context, scope: &mut Scope) -> T;
 }
 
-impl Interpretable for Clause {
-    fn interpret(&self, ctx: &mut Context, scope: &mut Scope) {
-        match self {
-            Clause::Lookup(e, a, v) => {
-                let ea_in = scope.new_collection_from(vec![(e, a)]).1.arrange_by_self();
-                ctx.ea_v.join_core(&ea_in, |&(e, a), v, _| Some(v)).arrange_by_self()
-            },
-            Clause::Pattern(e, a, v) => {
-                let e_in = scope.new_collection_from(vec![e]).1.arrange_by_self();
-                ctx.db.e_av.join_core(&e_in, |e, &(a, v), _| Some((a, v))).arrange_by_key()
-            }
-        }
+// impl Interpretable<Collection<Scope, Value>> for LookupPattern {
+//     fn interpret(&self, ctx: &mut Context, scope: &mut Scope) -> Collection<Scope, Value> {
+//         let &LookupPattern(e, a, v) = self;
+//         let ea_in = scope.new_collection_from(vec![(e, a)]).1.arrange_by_self();
+//         ctx.db.unwrap().ea_v.join_core(&ea_in, |&(e, a), v, _| Some(v)).arrange_by_self()
+//     }
+// }
+
+// impl Interpretable<Collection<Scope, (Attribute, Value)>> for EntityPattern {
+//     fn interpret(&self, ctx: &mut Context, scope: &mut Scope) -> Collection<Scope, (Attribute, Value)> {
+//         let &EntityPattern(e, a, v) = self;
+//         let e_in = scope.new_collection_from(vec![e]).1.arrange_by_self();
+//         ctx.db.unwrap().e_av.join_core(&e_in, |e, &(a, v), _| Some((a, v))).arrange_by_key()
+//     }
+// }
+
+impl<'a> Interpretable<Index<'a, (Attribute, Value), ()>> for HasAttrPattern {
+    fn interpret(&self, ctx: &mut Context, scope: &mut Scope) -> Index<'a, (Attribute, Value), ()> {
+        let &HasAttrPattern(e, a, v) = self;
+        let a_in = scope.new_collection_from(vec![a]).1.arrange_by_self();
+        ctx.db.unwrap().a_ev.join_core(&a_in, |a, &(e, v), _| Some((e, v))).arrange_by_key()
     }
 }
+
+// impl Interpretable<Collection<Scope, (Attribute, Value)>> for FilterPattern {
+//     fn interpret(&self, ctx: &mut Context, scope: &mut Scope) -> Collection<Scope, (Attribute, Value)> {
+//         let &FilterPattern(e, a, v) = self;
+//         let av_in = scope.new_collection_from(vec![(a, v)]).1.arrange_by_self();
+//         ctx.db.unwrap().av_e.join_core(&av_in, |&(a, v), e, _| Some(e)).arrange_by_self()
+//     }
+// }
 
 // make an input...
 // scope.new_collection_from(vec![v]).1.arrange_by_self(),
@@ -302,27 +347,19 @@ impl Interpretable for Clause {
 
 /// This takes a potentially JS-generated description of a dataflow
 /// graph and turns it into one that differential can understand.
-fn interpret<'a> (scope: &mut Child<'a, Root<Allocator>, u64>,
-                  datoms: &Collection<Child<'a, Root<Allocator>, u64>, Datom>,
-                  computation: u32) -> Probe {
-
-    // TODOS
-    // =====
-    // 
-    // @TODO inspect -> inspect_batch?
-    // @TODO move indicies into Context
+fn parse_graph<'a> (ctx: &mut Context, scope: &mut Child<'a, Root<Allocator>, usize>, datoms: &Collection<Scope, Datom>, computation: u32) -> Probe {
 
     // Given a query...
     // [?e :name ?name] [?e2 :name ?name]
-    let clause1 = Clause::HasAttr(Var(0), Const(ATTR_NAME), Var(1));
-    let clause2 = Clause::HasAttr(Var(2), Const(ATTR_NAME), Var(1));
+    let clause1 = HasAttrPattern(Var(0), Const(Value::Attribute(ATTR_NAME)), Var(1));
+    let clause2 = HasAttrPattern(Var(2), Const(Value::Attribute(ATTR_NAME)), Var(1));
 
     // We notice that two clauses share the same symbol, therfore we
     // must unify them.
-    let unified = Unification { a: clause1, b: clause2 };
+    // let unified = Unification { a: clause1, b: clause2 };
     
-    let r1 = clause1.interpret();
-    let r2 = clause2.interpret();
+    let r1 = clause1.interpret(ctx, scope);
+    let r2 = clause2.interpret(ctx, scope);
 
     // implicit join
     // let r3 = r2.join_core(&r1, |e, &v1, &v2| Some((*e, v1)))
@@ -363,7 +400,7 @@ fn interpret<'a> (scope: &mut Child<'a, Root<Allocator>, u64>,
 // }
 
 #[js_export]
-pub fn send(tx: u64, d: Vec<JsDatom>) -> bool {
+pub fn send(tx: usize, d: Vec<JsDatom>) -> bool {
     unsafe {
         match CTX {
             None => false,
@@ -393,3 +430,9 @@ pub fn send(tx: u64, d: Vec<JsDatom>) -> bool {
         }
     }
 }
+
+//
+// TODOS
+//
+// @TODO define interpretation in terms of Collection, rather than Arrange
+// @TODO inspect -> inspect_batch?
