@@ -1,7 +1,7 @@
 // import diff from "./differential_dataflow.js"
 
-__UGLY_DIFF_HOOK = (datum) => {
-  console.log('\t=>', datum)
+__UGLY_DIFF_HOOK = (tuple) => {
+  console.log('\t=>', tuple)
 }
 
 function main () {

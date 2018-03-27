@@ -288,13 +288,10 @@ pub fn register() -> bool {
 struct Placeholder;
 struct Var(u32);
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Abomonation, Debug)]
-struct Const(Value);
-
-struct LookupPattern(Const, Const, Var);
-struct EntityPattern(Const, Var, Var);
+struct LookupPattern(Entity, Attribute, Var);
+struct EntityPattern(Entity, Var, Var);
 struct HasAttrPattern(Var, Attribute, Var);
-struct FilterPattern(Var, Const, Const);
+struct FilterPattern(Var, Attribute, Value);
 
 enum Clause {
     Lookup(LookupPattern),
@@ -370,33 +367,37 @@ fn parse_graph(ctx: &mut Context) -> ProbeHandle {
 
     // Given a query...
     // [?e :name ?name] [?e2 :name ?name]
-    // let clause1 = HasAttrPattern(Var(0), ATTR_NAME, Var(1));
-    let clause2 = HasAttrPattern(Var(2), ATTR_NAME, Var(1));
+    let clause1 = HasAttrPattern(Var(0), ATTR_NAME, Var(1));
+    let clause2 = HasAttrPattern(Var(0), ATTR_AGE, Var(2));
 
     // We notice that two clauses share the same symbol, therfore we
     // must unify them.
     // let unified = Unification { a: clause1, b: clause2 };
     
-    // let mut r1 = clause1.interpret(ctx);
+    let mut r1 = clause1.interpret(ctx);
     let mut r2 = clause2.interpret(ctx);
 
-    // implicit join
-    // let r3 = r2.join_core(&r1, |e, &v1, &v2| Some((*e, v1)))
-
     let probe = ctx.root.dataflow::<usize, _, _>(|scope| {
-        r2
-            .import(scope)
+        let r1 = r1.import(scope);
+        let r2 = r2.import(scope);
+
+        // implicit join
+        let r3 = r2
+            .join_core(&r1, |e, & ref v1, & ref v2| Some((*e, (v1.clone(), v2.clone()))))
+            .arrange_by_key();
+        
+        r3
             .stream
             .inspect(|batch_wrapper| {
                 let batch = &batch_wrapper.item;
                 let mut batch_cursor = batch.cursor();
 
                 while batch_cursor.key_valid(&batch) {
-                    let e = batch_cursor.key(&batch);
-                    let v = batch_cursor.val(&batch);
+                    let (v1, v2) = batch_cursor.val(&batch).clone();
+                    let tuple = vec![Value::Eid(*batch_cursor.key(&batch)), v1, v2];
                     js! {
-                        var datom = @{JsDatom{e: *e, a: ATTR_NAME, v: v.clone()}};
-                        __UGLY_DIFF_HOOK(datom);
+                        var tuple = @{tuple};
+                        __UGLY_DIFF_HOOK(tuple);
                     }
 
                     batch_cursor.step_key(&batch);
