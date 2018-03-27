@@ -122,17 +122,17 @@ use std::rc::Rc;
 use timely::{Root, Allocator};
 use timely::dataflow::scopes::Child;
 use timely::dataflow::operators::*;
-use timely::dataflow::operators::probe::Handle;
+use timely::dataflow::operators::probe::{Handle, Probe};
 // use timely::dataflow::channels::pact::Pipeline;
 use timely::progress::timestamp::RootTimestamp;
 use timely::progress::nested::product::Product;
 use timely::execute::{setup_threadless};
 
 use input::{Input, InputSession};
-use trace::{Trace};
-use trace::implementations::ord::OrdValBatch;
+use trace::{BatchReader, Cursor};
+use trace::implementations::ord::{OrdKeyBatch, OrdValBatch};
 use trace::implementations::spine::Spine;
-use operators::arrange::{Arranged, ArrangeByKey, ArrangeBySelf, TraceAgent};
+use operators::arrange::{ArrangeByKey, ArrangeBySelf, TraceAgent};
 use operators::join::JoinCore;
 
 const ATTR_NAME: u32 = 100;
@@ -149,7 +149,7 @@ const VALUE_NAME_MABEL: u64 = 101;
 type Entity = u64;
 type Attribute = u32;
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Abomonation, Debug, Serialize, Deserialize)]
+#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Abomonation, Debug, Serialize, Deserialize)]
 enum Value {
     Eid(Entity),
     Attribute(Attribute),
@@ -194,78 +194,82 @@ js_deserializable!(JsDatom);
 
 type Scope<'a> = Child<'a, Root<Allocator>, usize>;
 type RootTime = Product<RootTimestamp, usize>;
-type Probe = Handle<RootTime>;
+type ProbeHandle = Handle<RootTime>;
 type InputHandle = InputSession<usize, Datom, isize>;
-// type TraceBatch = OrdValBatch<usize, usize, RootTime, isize>;
-// type TraceSpine = Spine<usize, usize, RootTime, isize, Rc<TraceBatch>>;
-// type TraceHandle = TraceAgent<usize, usize, RootTime, isize, TraceSpine>;
-type Index<'a, K, V> = Arranged<Scope<'a>, K, V, isize,
-                                TraceAgent<K, V, RootTime, isize,
-                                           Spine<K, V, RootTime, isize,
-                                                 Rc<OrdValBatch<K, V, RootTime, isize>>>>>;
+// type TraceBatch = OrdValBatch<Value, Value, RootTime, isize>;
+// type TraceSpine = Spine<Value, Value, RootTime, isize, Rc<TraceBatch>>;
+// type TraceHandle = TraceAgent<Value, Value, RootTime, isize, TraceSpine>;
+
+type KeyIndex<K> = TraceAgent<K, (), RootTime, isize,
+                              Spine<K, (), RootTime, isize,
+                                    Rc<OrdKeyBatch<K, RootTime, isize>>>>;
+
+type Index<K, V> = TraceAgent<K, V, RootTime, isize,
+                              Spine<K, V, RootTime, isize,
+                                    Rc<OrdValBatch<K, V, RootTime, isize>>>>;
 
 //
 // CONTEXT
 //
 
 struct DB {
-    e_av: Index<'static, Entity, (Attribute, Value)>,
-    a_ev: Index<'static, Attribute, (Entity, Value)>,
-    ea_v: Index<'static, (Entity, Attribute), Value>,
-    av_e: Index<'static, (Attribute, Value), Entity>,
+    e_av: Index<Entity, (Attribute, Value)>,
+    a_ev: Index<Attribute, (Entity, Value)>,
+    ea_v: Index<(Entity, Attribute), Value>,
+    av_e: Index<(Attribute, Value), Entity>,
+}
+
+enum PseudoInput {
+    A(KeyIndex<Attribute>),
 }
 
 pub struct Context {
     root: Root<Allocator>,
-    input_handle: Option<InputHandle>,
-    probe: Option<Probe>,
-    db: Option<DB>,
+    input_handle: InputHandle,
+    pseudo_inputs: Vec<PseudoInput>,
+    db: DB,
+    probe: Option<ProbeHandle>,
     // output_callbacks,
-}
-
-fn make_context() -> Context {
-    let root = setup_threadless();
-    Context {
-        root,
-        input_handle: None,
-        probe: None,
-        db: None,
-    }
 }
 
 static mut CTX: Option<Context> = None;
 
 #[js_export]
-pub fn setup() -> bool {
+pub fn setup() {
     unsafe {
-        CTX = Some(make_context());
-        true
+        let mut root = setup_threadless();
+        
+        let (input_handle, db) = root.dataflow::<usize,_,_>(|scope| {
+            let (input_handle, datoms) = scope.new_collection::<>();
+            let db = DB {
+                e_av: datoms.map(|(e, a, v)| (e, (a, v))).arrange_by_key().trace,
+                a_ev: datoms.map(|(e, a, v)| (a, (e, v))).arrange_by_key().trace,
+                ea_v: datoms.map(|(e, a, v)| ((e, a), v)).arrange_by_key().trace,
+                av_e: datoms.map(|(e, a, v)| ((a, v), e)).arrange_by_key().trace,
+            };
+
+            (input_handle, db)
+        });
+        
+        let ctx = Context {
+            root,
+            db,
+            input_handle,
+            pseudo_inputs: Vec::new(),
+            probe: None,
+        };
+
+        CTX = Some(ctx);
     }
 }
 
-// #[js_export]
-pub fn register(computation: u32) -> bool {
+#[js_export]
+pub fn register() -> bool {
     unsafe {
         match CTX {
             None => false,
             Some(ref mut ctx) => {
-                let (mut input, mut datoms, mut probe) = ctx.root.dataflow::<usize,_,_>(|mut scope| {
-                    let (datoms_in, datoms) = scope.new_collection::<>();
-                    let probe = parse_graph(ctx, &mut scope, &datoms, computation);
-                    
-                    (datoms_in, datoms, probe)
-                });
-
-                ctx.db = Some(DB {
-                    e_av: datoms.map(|(e, a, v)| (e, (a, v))).arrange_by_key(),
-                    a_ev: datoms.map(|(e, a, v)| (a, (e, v))).arrange_by_key(),
-                    ea_v: datoms.map(|(e, a, v)| ((e, a), v)).arrange_by_key(),
-                    av_e: datoms.map(|(e, a, v)| ((a, v), e)).arrange_by_key(),
-                });
-                
-                ctx.input_handle = Some(input);
-                ctx.probe = Some(probe);
-                
+                ctx.probe = Some(parse_graph(ctx));
                 true
             }
         }
@@ -289,7 +293,7 @@ struct Const(Value);
 
 struct LookupPattern(Const, Const, Var);
 struct EntityPattern(Const, Var, Var);
-struct HasAttrPattern(Var, Const, Var);
+struct HasAttrPattern(Var, Attribute, Var);
 struct FilterPattern(Var, Const, Const);
 
 enum Clause {
@@ -305,15 +309,15 @@ struct Unification { a: Clause, b: Clause, }
 // INTERPRETER
 // 
 
-trait Interpretable<T> {
-    fn interpret(&self, ctx: &mut Context, scope: &mut Scope) -> T;
+trait Interpretable<K, V> where K : 'static+Ord+Clone, V : 'static+Ord+Clone {
+    fn interpret(&self, ctx: &mut Context) -> Index<K, V>;
 }
 
 // impl Interpretable<Collection<Scope, Value>> for LookupPattern {
 //     fn interpret(&self, ctx: &mut Context, scope: &mut Scope) -> Collection<Scope, Value> {
 //         let &LookupPattern(e, a, v) = self;
 //         let ea_in = scope.new_collection_from(vec![(e, a)]).1.arrange_by_self();
-//         ctx.db.unwrap().ea_v.join_core(&ea_in, |&(e, a), v, _| Some(v)).arrange_by_self()
+//         ctx.db.ea_v.join_core(&ea_in, |&(e, a), v, _| Some(v)).arrange_by_self()
 //     }
 // }
 
@@ -321,15 +325,30 @@ trait Interpretable<T> {
 //     fn interpret(&self, ctx: &mut Context, scope: &mut Scope) -> Collection<Scope, (Attribute, Value)> {
 //         let &EntityPattern(e, a, v) = self;
 //         let e_in = scope.new_collection_from(vec![e]).1.arrange_by_self();
-//         ctx.db.unwrap().e_av.join_core(&e_in, |e, &(a, v), _| Some((a, v))).arrange_by_key()
+//         ctx.db.e_av.join_core(&e_in, |e, &(a, v), _| Some((a, v))).arrange_by_key()
 //     }
 // }
 
-impl<'a> Interpretable<Index<'a, (Attribute, Value), ()>> for HasAttrPattern {
-    fn interpret(&self, ctx: &mut Context, scope: &mut Scope) -> Index<'a, (Attribute, Value), ()> {
-        let &HasAttrPattern(e, a, v) = self;
-        let a_in = scope.new_collection_from(vec![a]).1.arrange_by_self();
-        ctx.db.unwrap().a_ev.join_core(&a_in, |a, &(e, v), _| Some((e, v))).arrange_by_key()
+impl Interpretable<Entity, Value> for HasAttrPattern {
+    fn interpret(&self, ctx: &mut Context) -> Index<Entity, Value> {
+        let &HasAttrPattern(_, a, _) = self;
+
+        let db = &mut ctx.db;
+            
+        let (_a_in, rel) = ctx.root.dataflow::<usize, _, _>(|scope| {
+            let a_in = scope.new_collection_from(vec![a]).1.arrange_by_self();
+            let rel = db.a_ev
+                .import(scope)
+                .join_core(&a_in, |_, &(ref e, ref v), _| Some((*e, v.clone())))
+                .arrange_by_key()
+                .trace;
+            
+            (a_in.trace, rel)
+        });
+        
+        // ctx.pseudo_inputs.push(PseudoInput::A(a_in));
+
+        rel
     }
 }
 
@@ -337,7 +356,7 @@ impl<'a> Interpretable<Index<'a, (Attribute, Value), ()>> for HasAttrPattern {
 //     fn interpret(&self, ctx: &mut Context, scope: &mut Scope) -> Collection<Scope, (Attribute, Value)> {
 //         let &FilterPattern(e, a, v) = self;
 //         let av_in = scope.new_collection_from(vec![(a, v)]).1.arrange_by_self();
-//         ctx.db.unwrap().av_e.join_core(&av_in, |&(a, v), e, _| Some(e)).arrange_by_self()
+//         ctx.db.av_e.join_core(&av_in, |&(a, v), e, _| Some(e)).arrange_by_self()
 //     }
 // }
 
@@ -347,32 +366,44 @@ impl<'a> Interpretable<Index<'a, (Attribute, Value), ()>> for HasAttrPattern {
 
 /// This takes a potentially JS-generated description of a dataflow
 /// graph and turns it into one that differential can understand.
-fn parse_graph<'a> (ctx: &mut Context, scope: &mut Child<'a, Root<Allocator>, usize>, datoms: &Collection<Scope, Datom>, computation: u32) -> Probe {
+fn parse_graph(ctx: &mut Context) -> ProbeHandle {
 
     // Given a query...
     // [?e :name ?name] [?e2 :name ?name]
-    let clause1 = HasAttrPattern(Var(0), Const(Value::Attribute(ATTR_NAME)), Var(1));
-    let clause2 = HasAttrPattern(Var(2), Const(Value::Attribute(ATTR_NAME)), Var(1));
+    // let clause1 = HasAttrPattern(Var(0), ATTR_NAME, Var(1));
+    let clause2 = HasAttrPattern(Var(2), ATTR_NAME, Var(1));
 
     // We notice that two clauses share the same symbol, therfore we
     // must unify them.
     // let unified = Unification { a: clause1, b: clause2 };
     
-    let r1 = clause1.interpret(ctx, scope);
-    let r2 = clause2.interpret(ctx, scope);
+    // let mut r1 = clause1.interpret(ctx);
+    let mut r2 = clause2.interpret(ctx);
 
     // implicit join
     // let r3 = r2.join_core(&r1, |e, &v1, &v2| Some((*e, v1)))
-    
-    let probe = r2
-        .inspect(|res| {
-            let (e, v) = res.0;
-            js! {
-                var datom = @{JsDatom{e, a: ATTR_NAME, v}};
-                __UGLY_DIFF_HOOK(datom);
-            }
-        })
-        .probe();
+
+    let probe = ctx.root.dataflow::<usize, _, _>(|scope| {
+        r2
+            .import(scope)
+            .stream
+            .inspect(|batch_wrapper| {
+                let batch = &batch_wrapper.item;
+                let mut batch_cursor = batch.cursor();
+
+                while batch_cursor.key_valid(&batch) {
+                    let e = batch_cursor.key(&batch);
+                    let v = batch_cursor.val(&batch);
+                    js! {
+                        var datom = @{JsDatom{e: *e, a: ATTR_NAME, v: v.clone()}};
+                        __UGLY_DIFF_HOOK(datom);
+                    }
+
+                    batch_cursor.step_key(&batch);
+                }
+            })
+            .probe()
+    });
 
     probe
 }
@@ -405,25 +436,20 @@ pub fn send(tx: usize, d: Vec<JsDatom>) -> bool {
         match CTX {
             None => false,
             Some(ref mut ctx) => {
-                match ctx.input_handle {
+                for js_datom in d {
+                    ctx.input_handle.insert((js_datom.e, js_datom.a, js_datom.v));
+                }
+                ctx.input_handle.advance_to(tx + 1);
+                ctx.input_handle.flush();
+
+                match ctx.probe {
                     None => false,
-                    Some(ref mut input) => {
-                        for js_datom in d {
-                            input.insert((js_datom.e, js_datom.a, js_datom.v));
+                    Some(ref mut probe) => {
+                        while probe.less_than(ctx.input_handle.time()) {
+                            ctx.root.step();
                         }
-                        input.advance_to(tx + 1);
-                        input.flush();
 
-                        match ctx.probe {
-                            None => false,
-                            Some(ref mut probe) => {
-                                while probe.less_than(input.time()) {
-                                    ctx.root.step();
-                                }
-
-                                true
-                            }
-                        }
+                        true
                     }
                 }
             }
@@ -432,7 +458,15 @@ pub fn send(tx: usize, d: Vec<JsDatom>) -> bool {
 }
 
 //
-// TODOS
+// TEST
 //
-// @TODO define interpretation in terms of Collection, rather than Arrange
-// @TODO inspect -> inspect_batch?
+
+#[js_export]
+pub fn test() {
+    setup();
+    register();
+    send(0, vec![
+        JsDatom {e: 1, a: 100, v: Value::Number(9012)},
+        JsDatom {e: 2, a: 200, v: Value::Number(123)},
+    ]);
+}
