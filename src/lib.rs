@@ -149,7 +149,7 @@ const VALUE_NAME_MABEL: u64 = 101;
 type Entity = u64;
 type Attribute = u32;
 
-#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Abomonation, Debug, Serialize, Deserialize)]
+#[derive(Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Abomonation, Debug, Serialize, Deserialize)]
 enum Value {
     Eid(Entity),
     Attribute(Attribute),
@@ -226,7 +226,6 @@ enum PseudoInput {
 pub struct Context {
     root: Root<Allocator>,
     input_handle: InputHandle,
-    pseudo_inputs: Vec<PseudoInput>,
     db: DB,
     probe: Option<ProbeHandle>,
     // output_callbacks,
@@ -255,7 +254,6 @@ pub fn setup() {
             root,
             db,
             input_handle,
-            pseudo_inputs: Vec::new(),
             probe: None,
         };
 
@@ -276,20 +274,17 @@ pub fn register() -> bool {
     }
 }
 
-// struct Relation {
-//     in: Vec<u32>,
-//     out: Vec<u32>,
-// }
-
 //
 // QUERY GRAMMAR
 //
 
 struct Placeholder;
+#[derive(Copy, Clone)]
 struct Var(u32);
 
 struct LookupPattern(Entity, Attribute, Var);
 struct EntityPattern(Entity, Var, Var);
+#[derive(Copy, Clone)]
 struct HasAttrPattern(Var, Attribute, Var);
 struct FilterPattern(Var, Attribute, Value);
 
@@ -300,14 +295,31 @@ enum Clause {
     Filter(FilterPattern),
 }
 
-struct Unification { a: Clause, b: Clause, }
+//
+// RELATIONS
+//
+
+trait Relation {
+    fn symbols(&self) -> &Vec<Var>;
+    fn tuples(&mut self) -> &mut Index<Value, Vec<Value>>;
+}
+
+struct SimpleRelation {
+    symbols: Vec<Var>,
+    tuples: Index<Value, Vec<Value>>,
+}
+
+impl Relation for SimpleRelation {
+    fn symbols(&self) -> &Vec<Var> { &self.symbols }
+    fn tuples(&mut self) -> &mut Index<Value, Vec<Value>> { &mut self.tuples }
+}
 
 //
 // INTERPRETER
 // 
 
-trait Interpretable<K, V> where K : 'static+Ord+Clone, V : 'static+Ord+Clone {
-    fn interpret(&self, ctx: &mut Context) -> Index<K, V>;
+trait Interpretable<R> where R : Relation {
+    fn interpret(&self, ctx: &mut Context) -> R;
 }
 
 // impl Interpretable<Collection<Scope, Value>> for LookupPattern {
@@ -326,9 +338,9 @@ trait Interpretable<K, V> where K : 'static+Ord+Clone, V : 'static+Ord+Clone {
 //     }
 // }
 
-impl Interpretable<Entity, Value> for HasAttrPattern {
-    fn interpret(&self, ctx: &mut Context) -> Index<Entity, Value> {
-        let &HasAttrPattern(_, a, _) = self;
+impl Interpretable<SimpleRelation> for HasAttrPattern {
+    fn interpret(&self, ctx: &mut Context) -> SimpleRelation {
+        let &HasAttrPattern(sym1, a, sym2) = self;
 
         let db = &mut ctx.db;
             
@@ -336,16 +348,22 @@ impl Interpretable<Entity, Value> for HasAttrPattern {
             let a_in = scope.new_collection_from(vec![a]).1.arrange_by_self();
             let rel = db.a_ev
                 .import(scope)
-                .join_core(&a_in, |_, &(ref e, ref v), _| Some((*e, v.clone())))
+                .join_core(&a_in, |_, &(ref e, v), _| {
+                    let mut vs: Vec<Value> = Vec::with_capacity(8);
+                    vs.push(v);
+                    
+                    Some((Value::Eid(*e), vs))
+                })
                 .arrange_by_key()
                 .trace;
             
             (a_in.trace, rel)
         });
         
-        // ctx.pseudo_inputs.push(PseudoInput::A(a_in));
-
-        rel
+        SimpleRelation {
+            symbols: vec![sym1, sym2],
+            tuples: rel
+        }
     }
 }
 
@@ -360,31 +378,53 @@ impl Interpretable<Entity, Value> for HasAttrPattern {
 // make an input...
 // scope.new_collection_from(vec![v]).1.arrange_by_self(),
 
+fn join<R: Relation> (ctx: &mut Context, mut rel1: R, syms: Vec<Var>, mut rel2: R) -> SimpleRelation {
+    let db = &mut ctx.db;
+    
+    let rel = ctx.root.dataflow::<usize, _, _>(|scope| {
+        let r1 = rel1.tuples().import(scope);
+        let r2 = rel2.tuples().import(scope);
+
+        r2
+            .join_core(&r1, |e, v1, v2| {
+                // @TODO can haz array here?
+                let mut vstar = Vec::with_capacity(v1.capacity() + v2.capacity());
+                vstar.append(&mut (*v1).clone());
+                vstar.append(&mut (*v2).clone());
+                
+                Some((*e, vstar))
+            })
+            .arrange_by_key()
+            .trace
+    });
+    
+    SimpleRelation {
+        symbols: syms,
+        tuples: rel
+    }
+}
 
 /// This takes a potentially JS-generated description of a dataflow
 /// graph and turns it into one that differential can understand.
 fn parse_graph(ctx: &mut Context) -> ProbeHandle {
 
-    // Given a query...
+    // @TODO pass a single scope around
+    
+    // @TODO output arrangement depends on whatever join comes next,
+    // so maybe not do the arrangement in the interpretation of the
+    // clause, but in the interpretation of the unification. should be
+    // ok, as long as it's all inside a single scope
+
     // [?e :name ?name] [?e2 :name ?name]
     let clause1 = HasAttrPattern(Var(0), ATTR_NAME, Var(1));
     let clause2 = HasAttrPattern(Var(0), ATTR_AGE, Var(2));
 
-    // We notice that two clauses share the same symbol, therfore we
-    // must unify them.
-    // let unified = Unification { a: clause1, b: clause2 };
-    
-    let mut r1 = clause1.interpret(ctx);
-    let mut r2 = clause2.interpret(ctx);
+    let mut r1 = Interpretable::interpret(&clause1, ctx);
+    let mut r2 = Interpretable::interpret(&clause2, ctx);
+    let mut r3 = join(ctx, r1, vec![Var(0)], r2);
 
     let probe = ctx.root.dataflow::<usize, _, _>(|scope| {
-        let r1 = r1.import(scope);
-        let r2 = r2.import(scope);
-
-        // implicit join
-        let r3 = r2
-            .join_core(&r1, |e, & ref v1, & ref v2| Some((*e, (v1.clone(), v2.clone()))))
-            .arrange_by_key();
+        let r3 = r3.tuples().import(scope);
         
         r3
             .stream
@@ -393,10 +433,9 @@ fn parse_graph(ctx: &mut Context) -> ProbeHandle {
                 let mut batch_cursor = batch.cursor();
 
                 while batch_cursor.key_valid(&batch) {
-                    let (v1, v2) = batch_cursor.val(&batch).clone();
-                    let tuple = vec![Value::Eid(*batch_cursor.key(&batch)), v1, v2];
+                    let vs = batch_cursor.val(&batch).clone();
                     js! {
-                        var tuple = @{tuple};
+                        const tuple = @{vs};
                         __UGLY_DIFF_HOOK(tuple);
                     }
 
