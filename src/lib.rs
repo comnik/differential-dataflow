@@ -219,10 +219,6 @@ struct DB {
     av_e: Index<(Attribute, Value), Entity>,
 }
 
-enum PseudoInput {
-    A(KeyIndex<Attribute>),
-}
-
 pub struct Context {
     root: Root<Allocator>,
     input_handle: InputHandle,
@@ -301,17 +297,17 @@ enum Clause {
 
 trait Relation {
     fn symbols(&self) -> &Vec<Var>;
-    fn tuples(&mut self) -> &mut Index<Value, Vec<Value>>;
+    fn tuples(&mut self) -> &mut KeyIndex<Vec<Value>>;
 }
 
 struct SimpleRelation {
     symbols: Vec<Var>,
-    tuples: Index<Value, Vec<Value>>,
+    tuples: KeyIndex<Vec<Value>>,
 }
 
 impl Relation for SimpleRelation {
     fn symbols(&self) -> &Vec<Var> { &self.symbols }
-    fn tuples(&mut self) -> &mut Index<Value, Vec<Value>> { &mut self.tuples }
+    fn tuples(&mut self) -> &mut KeyIndex<Vec<Value>> { &mut self.tuples }
 }
 
 //
@@ -352,9 +348,9 @@ impl Interpretable<SimpleRelation> for HasAttrPattern {
                     let mut vs: Vec<Value> = Vec::with_capacity(8);
                     vs.push(v);
                     
-                    Some((Value::Eid(*e), vs))
+                    Some(vs)
                 })
-                .arrange_by_key()
+                .arrange_by_self()
                 .trace;
             
             (a_in.trace, rel)
@@ -375,26 +371,21 @@ impl Interpretable<SimpleRelation> for HasAttrPattern {
 //     }
 // }
 
-// make an input...
-// scope.new_collection_from(vec![v]).1.arrange_by_self(),
-
 fn join<R: Relation> (ctx: &mut Context, mut rel1: R, syms: Vec<Var>, mut rel2: R) -> SimpleRelation {
-    let db = &mut ctx.db;
-    
     let rel = ctx.root.dataflow::<usize, _, _>(|scope| {
         let r1 = rel1.tuples().import(scope);
         let r2 = rel2.tuples().import(scope);
 
-        r2
-            .join_core(&r1, |e, v1, v2| {
+        r1
+            .join_core(&r2, |_key, v1, v2| {
                 // @TODO can haz array here?
-                let mut vstar = Vec::with_capacity(v1.capacity() + v2.capacity());
+                let mut vstar = Vec::with_capacity(v1.len() + v2.len());
                 vstar.append(&mut (*v1).clone());
                 vstar.append(&mut (*v2).clone());
                 
-                Some((*e, vstar))
+                Some(vstar)
             })
-            .arrange_by_key()
+            .arrange_by_self()
             .trace
     });
     
@@ -403,6 +394,24 @@ fn join<R: Relation> (ctx: &mut Context, mut rel1: R, syms: Vec<Var>, mut rel2: 
         tuples: rel
     }
 }
+
+// fn find<R: Relation> (ctx: &mut Context, rel: R, syms: Vec<Var>) -> SimpleRelation {
+//     let projection = ctx.root.dataflow::<usize, _, _>(|scope| {
+//         let rel = rel.tuples().import(scope);
+
+//         rel
+//             .map(|vs| {
+//                 Some((*e, vstar))
+//             })
+//             .arrange_by_self()
+//             .trace
+//     });
+    
+//     SimpleRelation {
+//         symbols: syms,
+//         tuples: projection
+//     }    
+// }
 
 /// This takes a potentially JS-generated description of a dataflow
 /// graph and turns it into one that differential can understand.
@@ -415,13 +424,16 @@ fn parse_graph(ctx: &mut Context) -> ProbeHandle {
     // clause, but in the interpretation of the unification. should be
     // ok, as long as it's all inside a single scope
 
+    // @TODO get pure-data like trace without doing arrange_by_self()?
+
     // [?e :name ?name] [?e2 :name ?name]
     let clause1 = HasAttrPattern(Var(0), ATTR_NAME, Var(1));
     let clause2 = HasAttrPattern(Var(0), ATTR_AGE, Var(2));
 
-    let mut r1 = Interpretable::interpret(&clause1, ctx);
-    let mut r2 = Interpretable::interpret(&clause2, ctx);
+    let r1 = Interpretable::interpret(&clause1, ctx);
+    let r2 = Interpretable::interpret(&clause2, ctx);
     let mut r3 = join(ctx, r1, vec![Var(0)], r2);
+    // let r4 = find(ctx, r33, vec![Var(0), Var(1), Var(2)]);
 
     let probe = ctx.root.dataflow::<usize, _, _>(|scope| {
         let r3 = r3.tuples().import(scope);
