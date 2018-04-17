@@ -152,18 +152,11 @@ pub enum Value {
 js_serializable!(Value);
 js_deserializable!(Value);
 
-// #[derive(Eq, Clone, Serialize, Deserialize, Abomonation, Debug)]
-#[derive(Serialize, Deserialize)]
-pub struct JsDatom {
-    e: Entity,
-    a: Attribute,
-    v: Value,
-}
+#[derive(Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Abomonation, Debug, Serialize, Deserialize)]
+pub struct Datom(Entity, Attribute, Value);
 
-type Datom = (Entity, Attribute, Value);
-
-js_serializable!(JsDatom);
-js_deserializable!(JsDatom);
+js_serializable!(Datom);
+js_deserializable!(Datom);
 
 // type Scope<'a> = Child<'a, Root<Allocator>, usize>;
 type RootTime = Product<RootTimestamp, usize>;
@@ -197,7 +190,6 @@ pub struct Context {
     input_handle: InputHandle,
     db: DB,
     probe: Option<ProbeHandle>,
-    // output_callbacks,
 }
 
 static mut CTX: Option<Context> = None;
@@ -208,12 +200,12 @@ pub fn setup() {
         let mut root = setup_threadless();
         
         let (input_handle, db) = root.dataflow::<usize,_,_>(|scope| {
-            let (input_handle, datoms) = scope.new_collection::<>();
+            let (input_handle, datoms) = scope.new_collection::<Datom, isize>();
             let db = DB {
-                e_av: datoms.map(|(e, a, v)| (e, (a, v))).arrange_by_key().trace,
-                a_ev: datoms.map(|(e, a, v)| (a, (e, v))).arrange_by_key().trace,
-                ea_v: datoms.map(|(e, a, v)| ((e, a), v)).arrange_by_key().trace,
-                av_e: datoms.map(|(e, a, v)| ((a, v), e)).arrange_by_key().trace,
+                e_av: datoms.map(|Datom(e, a, v)| (e, (a, v))).arrange_by_key().trace,
+                a_ev: datoms.map(|Datom(e, a, v)| (a, (e, v))).arrange_by_key().trace,
+                ea_v: datoms.map(|Datom(e, a, v)| ((e, a), v)).arrange_by_key().trace,
+                av_e: datoms.map(|Datom(e, a, v)| ((a, v), e)).arrange_by_key().trace,
             };
 
             (input_handle, db)
@@ -403,10 +395,7 @@ fn join<R: Relation> (ctx: &mut Context, mut rel1: R, syms: Vec<Var>, mut rel2: 
             .trace
     });
     
-    SimpleRelation {
-        symbols: syms,
-        tuples: rel
-    }
+    SimpleRelation { symbols: syms, tuples: rel }
 }
 
 // fn find<R: Relation> (ctx: &mut Context, rel: R, syms: Vec<Var>) -> SimpleRelation {
@@ -431,6 +420,8 @@ fn join<R: Relation> (ctx: &mut Context, mut rel1: R, syms: Vec<Var>, mut rel2: 
 /// graph and turns it into a differential dataflow.
 fn parse_graph(ctx: &mut Context, mut clauses: Vec<Clause>) -> ProbeHandle {
 
+    // @TODO return handles to modify the parameters of the query
+    
     // @TODO pass a single scope around
     
     // @TODO output arrangement depends on whatever join comes next,
@@ -492,13 +483,13 @@ fn parse_graph(ctx: &mut Context, mut clauses: Vec<Clause>) -> ProbeHandle {
 // }
 
 #[js_export]
-pub fn send(tx: usize, d: Vec<JsDatom>) -> bool {
+pub fn send(tx: usize, d: Vec<Datom>) -> bool {
     unsafe {
         match CTX {
             None => false,
             Some(ref mut ctx) => {
-                for js_datom in d {
-                    ctx.input_handle.insert((js_datom.e, js_datom.a, js_datom.v));
+                for datom in d {
+                    ctx.input_handle.insert(datom);
                 }
                 ctx.input_handle.advance_to(tx + 1);
                 ctx.input_handle.flush();
