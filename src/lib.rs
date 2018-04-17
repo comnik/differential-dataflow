@@ -373,13 +373,21 @@ impl Interpretable<SimpleRelation> for HasAttrPattern {
 
 fn join<R: Relation> (ctx: &mut Context, mut rel1: R, syms: Vec<Var>, mut rel2: R) -> SimpleRelation {
     let rel = ctx.root.dataflow::<usize, _, _>(|scope| {
-        let r1 = rel1.tuples().import(scope);
-        let r2 = rel2.tuples().import(scope);
+        let r1 = rel1.tuples()
+            .import(scope)
+            .as_collection(|k, &v| (vec![k[0]], k.clone()))
+            .arrange_by_key();
+        
+        let r2 = rel2.tuples()
+            .import(scope)
+            .as_collection(|k, &v| (vec![k[0]], k.clone()))
+            .arrange_by_key();
 
         r1
             .join_core(&r2, |_key, v1, v2| {
                 // @TODO can haz array here?
                 let mut vstar = Vec::with_capacity(v1.len() + v2.len());
+
                 vstar.append(&mut (*v1).clone());
                 vstar.append(&mut (*v2).clone());
                 
@@ -424,9 +432,6 @@ fn parse_graph(ctx: &mut Context) -> ProbeHandle {
     // clause, but in the interpretation of the unification. should be
     // ok, as long as it's all inside a single scope
 
-    // @TODO get pure-data like trace without doing arrange_by_self()?
-
-    // [?e :name ?name] [?e2 :name ?name]
     let clause1 = HasAttrPattern(Var(0), ATTR_NAME, Var(1));
     let clause2 = HasAttrPattern(Var(0), ATTR_AGE, Var(2));
 
@@ -445,7 +450,8 @@ fn parse_graph(ctx: &mut Context) -> ProbeHandle {
                 let mut batch_cursor = batch.cursor();
 
                 while batch_cursor.key_valid(&batch) {
-                    let vs = batch_cursor.val(&batch).clone();
+                    // let vs = batch_cursor.val(&batch).clone();
+                    let vs = batch_cursor.key(&batch);
                     js! {
                         const tuple = @{vs};
                         __UGLY_DIFF_HOOK(tuple);
