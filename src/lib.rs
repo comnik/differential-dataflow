@@ -120,7 +120,7 @@ use std::rc::Rc;
 // use lattice::Lattice;
 
 use timely::{Root, Allocator};
-use timely::dataflow::scopes::Child;
+// use timely::dataflow::scopes::Child;
 use timely::dataflow::operators::*;
 use timely::dataflow::operators::probe::{Handle, Probe};
 // use timely::dataflow::channels::pact::Pipeline;
@@ -134,10 +134,6 @@ use trace::implementations::ord::{OrdKeyBatch, OrdValBatch};
 use trace::implementations::spine::Spine;
 use operators::arrange::{ArrangeByKey, ArrangeBySelf, TraceAgent};
 use operators::join::JoinCore;
-
-const ATTR_NAME: u32 = 100;
-const ATTR_FRIEND: u32 = 200;
-const ATTR_AGE: u32 = 300; 
 
 //
 // TYPES
@@ -169,27 +165,7 @@ type Datom = (Entity, Attribute, Value);
 js_serializable!(JsDatom);
 js_deserializable!(JsDatom);
 
-// impl Ord for Datom {
-//     fn cmp(&self, other: &Datom) -> Ordering {
-//         self.e.cmp(&other.e)
-//             .then(self.a.cmp(&other.a))
-//             .then(self.v.cmp(&other.v))
-//     }
-// }
-
-// impl PartialOrd for Datom {
-//     fn partial_cmp(&self, other: &Datom) -> Option<Ordering> {
-//         Some(self.cmp(other))
-//     }
-// }
-
-// impl PartialEq for Datom {
-//     fn eq(&self, other: &Datom) -> bool {
-//         self.e == other.e
-//     }
-// }
-
-type Scope<'a> = Child<'a, Root<Allocator>, usize>;
+// type Scope<'a> = Child<'a, Root<Allocator>, usize>;
 type RootTime = Product<RootTimestamp, usize>;
 type ProbeHandle = Handle<RootTime>;
 type InputHandle = InputSession<usize, Datom, isize>;
@@ -256,6 +232,8 @@ pub fn setup() {
 
 #[js_export]
 pub fn register(clauses: Vec<Clause>) -> bool {
+    // @TODO take a string key to distinguish output callbacks
+    
     unsafe {
         match CTX {
             None => false,
@@ -312,35 +290,58 @@ trait Interpretable<R> where R : Relation {
     fn interpret(&self, ctx: &mut Context) -> R;
 }
 
-// impl Interpretable<Collection<Scope, Value>> for LookupPattern {
-//     fn interpret(&self, ctx: &mut Context, scope: &mut Scope) -> Collection<Scope, Value> {
-//         let &LookupPattern(e, a, v) = self;
-//         let ea_in = scope.new_collection_from(vec![(e, a)]).1.arrange_by_self();
-//         ctx.db.ea_v.join_core(&ea_in, |&(e, a), v, _| Some(v)).arrange_by_self()
-//     }
-// }
-
-// impl Interpretable<Collection<Scope, (Attribute, Value)>> for EntityPattern {
-//     fn interpret(&self, ctx: &mut Context, scope: &mut Scope) -> Collection<Scope, (Attribute, Value)> {
-//         let &EntityPattern(e, a, v) = self;
-//         let e_in = scope.new_collection_from(vec![e]).1.arrange_by_self();
-//         ctx.db.e_av.join_core(&e_in, |e, &(a, v), _| Some((a, v))).arrange_by_key()
-//     }
-// }
-
 impl Interpretable<SimpleRelation> for Clause {
     fn interpret(&self, ctx: &mut Context) -> SimpleRelation {
         let db = &mut ctx.db;
         
         match self {
+            &Clause::Lookup(e, a, sym1) => {
+                let (_ea_in, rel) = ctx.root.dataflow::<usize, _, _>(|scope| {
+                    let ea_in = scope.new_collection_from(vec![(e, a)]).1.arrange_by_self();
+                    let rel = db.ea_v
+                        .import(scope)
+                        .join_core(&ea_in, |_, &v, _| {
+                            let mut vs: Vec<Value> = Vec::with_capacity(8);
+                            vs.push(v);
+
+                            Some(vs)
+                        })
+                        .arrange_by_self()
+                        .trace;
+                    
+                    (ea_in.trace, rel)
+                });
+                
+                SimpleRelation { symbols: vec![sym1], tuples: rel }
+            },
+            &Clause::Entity(e, sym1, sym2) => {
+                let (_e_in, rel) = ctx.root.dataflow::<usize, _, _>(|scope| {
+                    let e_in = scope.new_collection_from(vec![e]).1.arrange_by_self();
+                    let rel = db.e_av
+                        .import(scope)
+                        .join_core(&e_in, |_, &(a, v), _| {
+                            let mut vs: Vec<Value> = Vec::with_capacity(8);
+                            vs.push(Value::Attribute(a));
+                            vs.push(v);
+
+                            Some(vs)
+                        })
+                        .arrange_by_self()
+                        .trace;
+                    
+                    (e_in.trace, rel)
+                });
+                
+                SimpleRelation { symbols: vec![sym1, sym2], tuples: rel }
+            },
             &Clause::HasAttr(sym1, a, sym2) => {
                 let (_a_in, rel) = ctx.root.dataflow::<usize, _, _>(|scope| {
                     let a_in = scope.new_collection_from(vec![a]).1.arrange_by_self();
                     let rel = db.a_ev
                         .import(scope)
-                        .join_core(&a_in, |_, &(ref e, v), _| {
+                        .join_core(&a_in, |_, &(e, v), _| {
                             let mut vs: Vec<Value> = Vec::with_capacity(8);
-                            vs.push(Value::Eid(*e));
+                            vs.push(Value::Eid(e));
                             vs.push(v);
                             
                             Some(vs)
@@ -351,23 +352,30 @@ impl Interpretable<SimpleRelation> for Clause {
                     (a_in.trace, rel)
                 });
                 
-                SimpleRelation {
-                    symbols: vec![sym1, sym2],
-                    tuples: rel
-                }
+                SimpleRelation { symbols: vec![sym1, sym2], tuples: rel }
             },
-            _ => panic!("Unknown pattern")
+            &Clause::Filter(sym1, a, v) => {
+                let (_av_in, rel) = ctx.root.dataflow::<usize, _, _>(|scope| {
+                    let av_in = scope.new_collection_from(vec![(a, v)]).1.arrange_by_self();
+                    let rel = db.av_e
+                        .import(scope)
+                        .join_core(&av_in, |_, &e, _| {
+                            let mut vs: Vec<Value> = Vec::with_capacity(8);
+                            vs.push(Value::Eid(e));
+                            
+                            Some(vs)
+                        })
+                        .arrange_by_self()
+                        .trace;
+                    
+                    (av_in.trace, rel)
+                });
+
+                SimpleRelation { symbols: vec![sym1], tuples: rel }
+            }
         }
     }
 }
-
-// impl Interpretable<Collection<Scope, (Attribute, Value)>> for FilterPattern {
-//     fn interpret(&self, ctx: &mut Context, scope: &mut Scope) -> Collection<Scope, (Attribute, Value)> {
-//         let &FilterPattern(e, a, v) = self;
-//         let av_in = scope.new_collection_from(vec![(a, v)]).1.arrange_by_self();
-//         ctx.db.av_e.join_core(&av_in, |&(a, v), e, _| Some(e)).arrange_by_self()
-//     }
-// }
 
 fn join<R: Relation> (ctx: &mut Context, mut rel1: R, syms: Vec<Var>, mut rel2: R) -> SimpleRelation {
     let rel = ctx.root.dataflow::<usize, _, _>(|scope| {
