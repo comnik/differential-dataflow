@@ -139,9 +139,6 @@ const ATTR_NAME: u32 = 100;
 const ATTR_FRIEND: u32 = 200;
 const ATTR_AGE: u32 = 300; 
 
-const VALUE_NAME_DIPPER: u64 = 100;
-const VALUE_NAME_MABEL: u64 = 101;
-
 //
 // TYPES
 //
@@ -150,7 +147,7 @@ type Entity = u64;
 type Attribute = u32;
 
 #[derive(Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Abomonation, Debug, Serialize, Deserialize)]
-enum Value {
+pub enum Value {
     Eid(Entity),
     Attribute(Attribute),
     Number(i64),
@@ -258,12 +255,12 @@ pub fn setup() {
 }
 
 #[js_export]
-pub fn register() -> bool {
+pub fn register(clauses: Vec<Clause>) -> bool {
     unsafe {
         match CTX {
             None => false,
             Some(ref mut ctx) => {
-                ctx.probe = Some(parse_graph(ctx));
+                ctx.probe = Some(parse_graph(ctx, clauses));
                 true
             }
         }
@@ -275,21 +272,18 @@ pub fn register() -> bool {
 //
 
 struct Placeholder;
-#[derive(Copy, Clone)]
-struct Var(u32);
+type Var = u32;
 
-struct LookupPattern(Entity, Attribute, Var);
-struct EntityPattern(Entity, Var, Var);
-#[derive(Copy, Clone)]
-struct HasAttrPattern(Var, Attribute, Var);
-struct FilterPattern(Var, Attribute, Value);
-
-enum Clause {
-    Lookup(LookupPattern),
-    Entity(EntityPattern),
-    HasAttr(HasAttrPattern),
-    Filter(FilterPattern),
+#[derive(Serialize, Deserialize, Copy, Clone)]
+pub enum Clause {
+    Lookup(Entity, Attribute, Var),
+    Entity(Entity, Var, Var),
+    HasAttr(Var, Attribute, Var),
+    Filter(Var, Attribute, Value),
 }
+
+js_serializable!(Clause);
+js_deserializable!(Clause);
 
 //
 // RELATIONS
@@ -334,31 +328,35 @@ trait Interpretable<R> where R : Relation {
 //     }
 // }
 
-impl Interpretable<SimpleRelation> for HasAttrPattern {
+impl Interpretable<SimpleRelation> for Clause {
     fn interpret(&self, ctx: &mut Context) -> SimpleRelation {
-        let &HasAttrPattern(sym1, a, sym2) = self;
-
         let db = &mut ctx.db;
-            
-        let (_a_in, rel) = ctx.root.dataflow::<usize, _, _>(|scope| {
-            let a_in = scope.new_collection_from(vec![a]).1.arrange_by_self();
-            let rel = db.a_ev
-                .import(scope)
-                .join_core(&a_in, |_, &(ref e, v), _| {
-                    let mut vs: Vec<Value> = Vec::with_capacity(8);
-                    vs.push(v);
-                    
-                    Some(vs)
-                })
-                .arrange_by_self()
-                .trace;
-            
-            (a_in.trace, rel)
-        });
         
-        SimpleRelation {
-            symbols: vec![sym1, sym2],
-            tuples: rel
+        match self {
+            &Clause::HasAttr(sym1, a, sym2) => {
+                let (_a_in, rel) = ctx.root.dataflow::<usize, _, _>(|scope| {
+                    let a_in = scope.new_collection_from(vec![a]).1.arrange_by_self();
+                    let rel = db.a_ev
+                        .import(scope)
+                        .join_core(&a_in, |_, &(ref e, v), _| {
+                            let mut vs: Vec<Value> = Vec::with_capacity(8);
+                            vs.push(Value::Eid(*e));
+                            vs.push(v);
+                            
+                            Some(vs)
+                        })
+                        .arrange_by_self()
+                        .trace;
+                    
+                    (a_in.trace, rel)
+                });
+                
+                SimpleRelation {
+                    symbols: vec![sym1, sym2],
+                    tuples: rel
+                }
+            },
+            _ => panic!("Unknown pattern")
         }
     }
 }
@@ -375,12 +373,12 @@ fn join<R: Relation> (ctx: &mut Context, mut rel1: R, syms: Vec<Var>, mut rel2: 
     let rel = ctx.root.dataflow::<usize, _, _>(|scope| {
         let r1 = rel1.tuples()
             .import(scope)
-            .as_collection(|k, &v| (vec![k[0]], k.clone()))
+            .as_collection(|k, _v| (vec![k[0]], k.clone()))
             .arrange_by_key();
         
         let r2 = rel2.tuples()
             .import(scope)
-            .as_collection(|k, &v| (vec![k[0]], k.clone()))
+            .as_collection(|k, _v| (vec![k[0]], k.clone()))
             .arrange_by_key();
 
         r1
@@ -422,8 +420,8 @@ fn join<R: Relation> (ctx: &mut Context, mut rel1: R, syms: Vec<Var>, mut rel2: 
 // }
 
 /// This takes a potentially JS-generated description of a dataflow
-/// graph and turns it into one that differential can understand.
-fn parse_graph(ctx: &mut Context) -> ProbeHandle {
+/// graph and turns it into a differential dataflow.
+fn parse_graph(ctx: &mut Context, mut clauses: Vec<Clause>) -> ProbeHandle {
 
     // @TODO pass a single scope around
     
@@ -432,13 +430,10 @@ fn parse_graph(ctx: &mut Context) -> ProbeHandle {
     // clause, but in the interpretation of the unification. should be
     // ok, as long as it's all inside a single scope
 
-    let clause1 = HasAttrPattern(Var(0), ATTR_NAME, Var(1));
-    let clause2 = HasAttrPattern(Var(0), ATTR_AGE, Var(2));
-
-    let r1 = Interpretable::interpret(&clause1, ctx);
-    let r2 = Interpretable::interpret(&clause2, ctx);
-    let mut r3 = join(ctx, r1, vec![Var(0)], r2);
-    // let r4 = find(ctx, r33, vec![Var(0), Var(1), Var(2)]);
+    let r1 = Interpretable::interpret(&clauses.pop().unwrap(), ctx);
+    let r2 = Interpretable::interpret(&clauses.pop().unwrap(), ctx);
+    let mut r3 = join(ctx, r1, vec![0], r2);
+    // let r4 = find(ctx, r33, vec![0, 1, 2]);
 
     let probe = ctx.root.dataflow::<usize, _, _>(|scope| {
         let r3 = r3.tuples().import(scope);
@@ -513,18 +508,4 @@ pub fn send(tx: usize, d: Vec<JsDatom>) -> bool {
             }
         }
     }
-}
-
-//
-// TEST
-//
-
-#[js_export]
-pub fn test() {
-    setup();
-    register();
-    send(0, vec![
-        JsDatom {e: 1, a: 100, v: Value::Number(9012)},
-        JsDatom {e: 2, a: 200, v: Value::Number(123)},
-    ]);
 }
