@@ -115,24 +115,25 @@ pub mod collection;
 use stdweb::js_export;
 
 use std::rc::Rc;
+use std::boxed::Box;
+use std::ops::Deref;
 // use std::hash::Hash;
 // use std::cmp::Ordering;
 // use lattice::Lattice;
 
 use timely::{Root, Allocator};
-// use timely::dataflow::scopes::Child;
-use timely::dataflow::operators::*;
-use timely::dataflow::operators::probe::{Handle, Probe};
+use timely::dataflow::scopes::Child;
+// use timely::dataflow::operators::*;
+use timely::dataflow::operators::probe::{Handle};
 // use timely::dataflow::channels::pact::Pipeline;
 use timely::progress::timestamp::RootTimestamp;
 use timely::progress::nested::product::Product;
 use timely::execute::{setup_threadless};
 
 use input::{Input, InputSession};
-use trace::{BatchReader, Cursor};
 use trace::implementations::ord::{OrdKeyBatch, OrdValBatch};
 use trace::implementations::spine::Spine;
-use operators::arrange::{ArrangeByKey, ArrangeBySelf, TraceAgent};
+use operators::arrange::{Arranged, ArrangeByKey, ArrangeBySelf, TraceAgent};
 use operators::join::JoinCore;
 
 //
@@ -158,7 +159,7 @@ pub struct Datom(Entity, Attribute, Value);
 js_serializable!(Datom);
 js_deserializable!(Datom);
 
-// type Scope<'a> = Child<'a, Root<Allocator>, usize>;
+type Scope<'a> = Child<'a, Root<Allocator>, usize>;
 type RootTime = Product<RootTimestamp, usize>;
 type ProbeHandle = Handle<RootTime>;
 type InputHandle = InputSession<usize, Datom, isize>;
@@ -166,14 +167,19 @@ type InputHandle = InputSession<usize, Datom, isize>;
 // type TraceSpine = Spine<Value, Value, RootTime, isize, Rc<TraceBatch>>;
 // type TraceHandle = TraceAgent<Value, Value, RootTime, isize, TraceSpine>;
 
-type KeyIndex<K> = TraceAgent<K, (), RootTime, isize,
-                              Spine<K, (), RootTime, isize,
-                                    Rc<OrdKeyBatch<K, RootTime, isize>>>>;
+// type KeyIndex<K> = TraceAgent<K, (), RootTime, isize,
+//                               Spine<K, (), RootTime, isize,
+//                                     Rc<OrdKeyBatch<K, RootTime, isize>>>>;
 
 type Index<K, V> = TraceAgent<K, V, RootTime, isize,
                               Spine<K, V, RootTime, isize,
                                     Rc<OrdValBatch<K, V, RootTime, isize>>>>;
 
+// type Arrangement<'a, K, V> = Arranged<Scope<'a>, K, V, isize,
+//                                       TraceAgent<K, V, RootTime, isize,
+//                                                  Spine<K, V, RootTime, isize,
+//                                                        Rc<OrdValBatch<K, V, RootTime, isize>>>>>;
+    
 //
 // CONTEXT
 //
@@ -193,6 +199,168 @@ pub struct Context {
 }
 
 static mut CTX: Option<Context> = None;
+
+//
+// QUERY PLAN GRAMMAR
+//
+// @TODO how to handle placeholders? maybe just convert them to unique variable names?
+
+#[derive(Serialize, Deserialize, Clone)]
+pub enum Plan {
+    Project(Box<Plan>, Vec<Var>),
+    Join(Box<Plan>, Box<Plan>, Var),
+    Lookup(Entity, Attribute, Var),
+    Entity(Entity, Var, Var),
+    HasAttr(Var, Attribute, Var),
+    Filter(Var, Attribute, Value)
+}
+
+js_serializable!(Plan);
+js_deserializable!(Plan);
+
+type Var = u32;
+
+//
+// RELATIONS
+//
+
+trait Relation<'a> {
+    fn tuples(&mut self) -> &mut Collection<Scope<'a>, Vec<Value>>;
+    // fn tuples_by_symbols(&self, syms: Vec<Var>) -> Arrangement<'a, Vec<Value>, Vec<Value>>;
+    fn tuples_by_symbols(&mut self, syms: Vec<Var>) -> Collection<Scope<'a>, (Vec<Value>, Vec<Value>)>;
+}
+
+struct SimpleRelation<'a> {
+    symbols: Vec<Var>,
+    tuples: Collection<Scope<'a>, Vec<Value>>,
+}
+
+impl<'a> Relation<'a> for SimpleRelation<'a> {
+    fn tuples(&mut self) -> &mut Collection<Scope<'a>, Vec<Value>> { &mut self.tuples }
+
+    fn tuples_by_symbols(&mut self, _syms: Vec<Var>) -> Collection<Scope<'a>, (Vec<Value>, Vec<Value>)>{
+        // let symbol_idx = move |sym: &Var| self.symbols.iter().position(|&v| *sym == v).unwrap();
+        self.tuples()
+        // .map(move |tuple| (syms.iter().map(|sym| tuple[symbol_idx(sym)]).collect(), tuple))
+            .map(|tuple| (vec![tuple[0]], tuple))
+            // .arrange_by_key()
+    }
+}
+
+//
+// QUERY PLAN IMPLEMENTATION
+//
+// @TODO return handles to modify the parameters of the query
+// @TODO pass a single scope around
+// @TODO output arrangement depends on whatever join comes next,
+// so maybe not do the arrangement in the interpretation of the
+// clause, but in the interpretation of the unification. should be
+// ok, as long as it's all inside a single scope
+
+/// Takes a query plan and turns it into a differential dataflow. The
+/// dataflow is extended to feed output tuples to JS clients. A probe
+/// on the dataflow is returned.
+fn implement(plan: Plan, ctx: &mut Context) -> ProbeHandle {
+    let db = &mut ctx.db;
+    ctx.root.dataflow::<usize, _, _>(|mut scope| {
+        let mut output_relation = implement_plan(&plan, db, &mut scope);
+
+        output_relation.tuples()
+            .inspect(|&(ref tuple, _x, _y)| {
+                js! {
+                    __UGLY_DIFF_HOOK(@{tuple});
+                }
+            })
+            .probe()
+    })
+}
+
+fn implement_plan<'a>(plan: &Plan, db: &mut DB, scope: &mut Scope<'a>) -> SimpleRelation<'a> {
+    match plan {
+        &Plan::Project(ref sub_plan, ref symbols) => {
+            let mut relation = implement_plan(sub_plan.deref(), db, scope);
+            let tuples = relation
+                .tuples_by_symbols(symbols.clone())
+                .map(|(key, _tuple)| key);
+            
+            SimpleRelation { symbols: symbols.to_vec(), tuples }
+        },
+        &Plan::Join(ref left_plan, ref right_plan, join_var) => {
+            let mut left = implement_plan(left_plan.deref(), db, scope);
+            let mut right = implement_plan(right_plan.deref(), db, scope);
+
+            let symbols = vec![join_var];
+            let tuples = left.tuples_by_symbols(symbols.clone())
+                .arrange_by_key()
+                .join_core(&right.tuples_by_symbols(symbols.clone()).arrange_by_key(), |_key, v1, v2| {
+                    // @TODO can haz array here?
+                    let mut vstar = Vec::with_capacity(v1.len() + v2.len());
+                    
+                    vstar.append(&mut (*v1).clone());
+                    vstar.append(&mut (*v2).clone());
+                    
+                    Some(vstar)                    
+                });
+
+            // @TODO correct symbols here
+            SimpleRelation { symbols, tuples }
+        },
+        &Plan::Lookup(e, a, sym1) => {
+            let ea_in = scope.new_collection_from(vec![(e, a)]).1.arrange_by_self();
+            let tuples = db.ea_v.import(scope)
+                .join_core(&ea_in, |_, &v, _| {
+                    let mut vs: Vec<Value> = Vec::with_capacity(8);
+                    vs.push(v);
+
+                    Some(vs)
+                });
+            
+            SimpleRelation { symbols: vec![sym1], tuples }
+        },
+        &Plan::Entity(e, sym1, sym2) => {
+            let e_in = scope.new_collection_from(vec![e]).1.arrange_by_self();
+            let tuples = db.e_av.import(scope)
+                .join_core(&e_in, |_, &(a, v), _| {
+                    let mut vs: Vec<Value> = Vec::with_capacity(8);
+                    vs.push(Value::Attribute(a));
+                    vs.push(v);
+
+                    Some(vs)
+                });
+            
+            SimpleRelation { symbols: vec![sym1, sym2], tuples }
+        },
+        &Plan::HasAttr(sym1, a, sym2) => {
+            let a_in = scope.new_collection_from(vec![a]).1.arrange_by_self();
+            let tuples = db.a_ev.import(scope)
+                .join_core(&a_in, |_, &(e, v), _| {
+                    let mut vs: Vec<Value> = Vec::with_capacity(8);
+                    vs.push(Value::Eid(e));
+                    vs.push(v);
+                    
+                    Some(vs)
+                });
+            
+            SimpleRelation { symbols: vec![sym1, sym2], tuples }
+        },
+        &Plan::Filter(sym1, a, v) => {
+            let av_in = scope.new_collection_from(vec![(a, v)]).1.arrange_by_self();
+            let tuples = db.av_e.import(scope)
+                .join_core(&av_in, |_, &e, _| {
+                    let mut vs: Vec<Value> = Vec::with_capacity(8);
+                    vs.push(Value::Eid(e));
+                    
+                    Some(vs)
+                });
+                
+            SimpleRelation { symbols: vec![sym1], tuples }
+        }
+    }
+}
+
+//
+// PUBLIC API
+//
 
 #[js_export]
 pub fn setup() {
@@ -223,264 +391,19 @@ pub fn setup() {
 }
 
 #[js_export]
-pub fn register(clauses: Vec<Clause>) -> bool {
+pub fn register(plan: Plan) -> bool {
     // @TODO take a string key to distinguish output callbacks
     
     unsafe {
         match CTX {
             None => false,
             Some(ref mut ctx) => {
-                ctx.probe = Some(parse_graph(ctx, clauses));
+                ctx.probe = Some(implement(plan, ctx));
                 true
             }
         }
     }
 }
-
-//
-// QUERY GRAMMAR
-//
-
-struct Placeholder;
-type Var = u32;
-
-#[derive(Serialize, Deserialize, Copy, Clone)]
-pub enum Clause {
-    Lookup(Entity, Attribute, Var),
-    Entity(Entity, Var, Var),
-    HasAttr(Var, Attribute, Var),
-    Filter(Var, Attribute, Value),
-}
-
-js_serializable!(Clause);
-js_deserializable!(Clause);
-
-//
-// RELATIONS
-//
-
-trait Relation {
-    fn symbols(&self) -> &Vec<Var>;
-    fn tuples(&mut self) -> &mut KeyIndex<Vec<Value>>;
-}
-
-struct SimpleRelation {
-    symbols: Vec<Var>,
-    tuples: KeyIndex<Vec<Value>>,
-}
-
-impl Relation for SimpleRelation {
-    fn symbols(&self) -> &Vec<Var> { &self.symbols }
-    fn tuples(&mut self) -> &mut KeyIndex<Vec<Value>> { &mut self.tuples }
-}
-
-//
-// INTERPRETER
-// 
-
-trait Interpretable<R> where R : Relation {
-    fn interpret(&self, ctx: &mut Context) -> R;
-}
-
-impl Interpretable<SimpleRelation> for Clause {
-    fn interpret(&self, ctx: &mut Context) -> SimpleRelation {
-        let db = &mut ctx.db;
-        
-        match self {
-            &Clause::Lookup(e, a, sym1) => {
-                let (_ea_in, rel) = ctx.root.dataflow::<usize, _, _>(|scope| {
-                    let ea_in = scope.new_collection_from(vec![(e, a)]).1.arrange_by_self();
-                    let rel = db.ea_v
-                        .import(scope)
-                        .join_core(&ea_in, |_, &v, _| {
-                            let mut vs: Vec<Value> = Vec::with_capacity(8);
-                            vs.push(v);
-
-                            Some(vs)
-                        })
-                        .arrange_by_self()
-                        .trace;
-                    
-                    (ea_in.trace, rel)
-                });
-                
-                SimpleRelation { symbols: vec![sym1], tuples: rel }
-            },
-            &Clause::Entity(e, sym1, sym2) => {
-                let (_e_in, rel) = ctx.root.dataflow::<usize, _, _>(|scope| {
-                    let e_in = scope.new_collection_from(vec![e]).1.arrange_by_self();
-                    let rel = db.e_av
-                        .import(scope)
-                        .join_core(&e_in, |_, &(a, v), _| {
-                            let mut vs: Vec<Value> = Vec::with_capacity(8);
-                            vs.push(Value::Attribute(a));
-                            vs.push(v);
-
-                            Some(vs)
-                        })
-                        .arrange_by_self()
-                        .trace;
-                    
-                    (e_in.trace, rel)
-                });
-                
-                SimpleRelation { symbols: vec![sym1, sym2], tuples: rel }
-            },
-            &Clause::HasAttr(sym1, a, sym2) => {
-                let (_a_in, rel) = ctx.root.dataflow::<usize, _, _>(|scope| {
-                    let a_in = scope.new_collection_from(vec![a]).1.arrange_by_self();
-                    let rel = db.a_ev
-                        .import(scope)
-                        .join_core(&a_in, |_, &(e, v), _| {
-                            let mut vs: Vec<Value> = Vec::with_capacity(8);
-                            vs.push(Value::Eid(e));
-                            vs.push(v);
-                            
-                            Some(vs)
-                        })
-                        .arrange_by_self()
-                        .trace;
-                    
-                    (a_in.trace, rel)
-                });
-                
-                SimpleRelation { symbols: vec![sym1, sym2], tuples: rel }
-            },
-            &Clause::Filter(sym1, a, v) => {
-                let (_av_in, rel) = ctx.root.dataflow::<usize, _, _>(|scope| {
-                    let av_in = scope.new_collection_from(vec![(a, v)]).1.arrange_by_self();
-                    let rel = db.av_e
-                        .import(scope)
-                        .join_core(&av_in, |_, &e, _| {
-                            let mut vs: Vec<Value> = Vec::with_capacity(8);
-                            vs.push(Value::Eid(e));
-                            
-                            Some(vs)
-                        })
-                        .arrange_by_self()
-                        .trace;
-                    
-                    (av_in.trace, rel)
-                });
-
-                SimpleRelation { symbols: vec![sym1], tuples: rel }
-            }
-        }
-    }
-}
-
-fn join<R: Relation> (ctx: &mut Context, mut rel1: R, syms: Vec<Var>, mut rel2: R) -> SimpleRelation {
-    let rel = ctx.root.dataflow::<usize, _, _>(|scope| {
-        let r1 = rel1.tuples()
-            .import(scope)
-            .as_collection(|k, _v| (vec![k[0]], k.clone()))
-            .arrange_by_key();
-        
-        let r2 = rel2.tuples()
-            .import(scope)
-            .as_collection(|k, _v| (vec![k[0]], k.clone()))
-            .arrange_by_key();
-
-        r1
-            .join_core(&r2, |_key, v1, v2| {
-                // @TODO can haz array here?
-                let mut vstar = Vec::with_capacity(v1.len() + v2.len());
-
-                vstar.append(&mut (*v1).clone());
-                vstar.append(&mut (*v2).clone());
-                
-                Some(vstar)
-            })
-            .arrange_by_self()
-            .trace
-    });
-    
-    SimpleRelation { symbols: syms, tuples: rel }
-}
-
-// fn find<R: Relation> (ctx: &mut Context, rel: R, syms: Vec<Var>) -> SimpleRelation {
-//     let projection = ctx.root.dataflow::<usize, _, _>(|scope| {
-//         let rel = rel.tuples().import(scope);
-
-//         rel
-//             .map(|vs| {
-//                 Some((*e, vstar))
-//             })
-//             .arrange_by_self()
-//             .trace
-//     });
-    
-//     SimpleRelation {
-//         symbols: syms,
-//         tuples: projection
-//     }    
-// }
-
-/// This takes a potentially JS-generated description of a dataflow
-/// graph and turns it into a differential dataflow.
-fn parse_graph(ctx: &mut Context, mut clauses: Vec<Clause>) -> ProbeHandle {
-
-    // @TODO return handles to modify the parameters of the query
-    
-    // @TODO pass a single scope around
-    
-    // @TODO output arrangement depends on whatever join comes next,
-    // so maybe not do the arrangement in the interpretation of the
-    // clause, but in the interpretation of the unification. should be
-    // ok, as long as it's all inside a single scope
-
-    let r1 = Interpretable::interpret(&clauses.pop().unwrap(), ctx);
-    let r2 = Interpretable::interpret(&clauses.pop().unwrap(), ctx);
-    let mut r3 = join(ctx, r1, vec![0], r2);
-    // let r4 = find(ctx, r33, vec![0, 1, 2]);
-
-    let probe = ctx.root.dataflow::<usize, _, _>(|scope| {
-        let r3 = r3.tuples().import(scope);
-        
-        r3
-            .stream
-            .inspect(|batch_wrapper| {
-                let batch = &batch_wrapper.item;
-                let mut batch_cursor = batch.cursor();
-
-                while batch_cursor.key_valid(&batch) {
-                    // let vs = batch_cursor.val(&batch).clone();
-                    let vs = batch_cursor.key(&batch);
-                    js! {
-                        const tuple = @{vs};
-                        __UGLY_DIFF_HOOK(tuple);
-                    }
-
-                    batch_cursor.step_key(&batch);
-                }
-            })
-            .probe()
-    });
-
-    probe
-}
-
-// #[js_export]
-// pub fn demo() {
-//     let mut root = setup_threadless();
-//     let probe = root.dataflow::<(),_,_>(|scope| {
-//         let stream = (0 .. 9)
-//             .to_stream(scope)
-//             .map(|x| x + 1)
-//             .sink(Pipeline, "example", |input| {
-//                 while let Some((time, data)) = input.next() {
-//                     for datum in data.iter() {
-//                         js! {
-//                             var datum = @{datum};
-//                             __UGLY_DIFF_HOOK(datum);
-//                         }
-//                     }
-//                 }
-//             });
-//     });
-
-//     root.step();
-// }
 
 #[js_export]
 pub fn send(tx: usize, d: Vec<Datom>) -> bool {
