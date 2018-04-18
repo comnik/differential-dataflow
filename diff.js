@@ -13,6 +13,8 @@ function main () {
 }
 
 const samplePlans = [
+  {HasAttr: [0, 100, 1]},
+  {Filter: [0, 100, {Number: 888}]},
   {Project: [
     {Join: [
       {HasAttr: [0, 300, 1]},
@@ -23,13 +25,21 @@ const samplePlans = [
     {HasAttr: [0, 200, 1]},
     {HasAttr: [0, 100, 2]},
     0]},
-  {HasAttr: [0, 100, 1]},
   {Project: [
     {Join: [
       {HasAttr: [0, 200, 1]},
       {HasAttr: [2, 100, 1]},
       1]},
     [0, 2]]},
+  {Project: [
+    {Join: [
+      {Join: [
+	{HasAttr: [0, 200, 1]},
+	{HasAttr: [2, 100, 1]},
+	1]},
+      {Filter: [0, 100, {Number: 888}]},
+      0]},
+    [0, 2, 1]]},
 ]
 
 function test (i=0) {
