@@ -14,9 +14,20 @@ function main () {
   })
 }
 
-function test () {
+const samplePlans = [
+  {Join: [
+    {HasAttr: [0, 300, 1]},
+    {HasAttr: [0, 100, 2]},
+    0]},
+  {Join: [
+    {HasAttr: [0, 200, 1]},
+    {HasAttr: [0, 100, 2]},
+    0]},
+]
+
+function test (i=0) {
   dd.setup()
-  dd.register([{HasAttr: [0, 300, 1]}, {HasAttr: [0, 100, 2]}])
+  dd.register(samplePlans[i])
   dd.send(0, [
     [1, 100, {Number: 9012}],
     [1, 300, {Number: 123}],
