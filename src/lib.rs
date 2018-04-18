@@ -225,8 +225,8 @@ type Var = u32;
 //
 
 trait Relation<'a> {
+    fn symbols(&self) -> &Vec<Var>;
     fn tuples(&mut self) -> &mut Collection<Scope<'a>, Vec<Value>>;
-    // fn tuples_by_symbols(&self, syms: Vec<Var>) -> Arrangement<'a, Vec<Value>, Vec<Value>>;
     fn tuples_by_symbols(&mut self, syms: Vec<Var>) -> Collection<Scope<'a>, (Vec<Value>, Vec<Value>)>;
 }
 
@@ -236,14 +236,21 @@ struct SimpleRelation<'a> {
 }
 
 impl<'a> Relation<'a> for SimpleRelation<'a> {
+    fn symbols(&self) -> &Vec<Var> { &self.symbols }
     fn tuples(&mut self) -> &mut Collection<Scope<'a>, Vec<Value>> { &mut self.tuples }
 
-    fn tuples_by_symbols(&mut self, _syms: Vec<Var>) -> Collection<Scope<'a>, (Vec<Value>, Vec<Value>)>{
-        // let symbol_idx = move |sym: &Var| self.symbols.iter().position(|&v| *sym == v).unwrap();
+    fn tuples_by_symbols(&mut self, syms: Vec<Var>) -> Collection<Scope<'a>, (Vec<Value>, Vec<Value>)>{
+        let relation_symbols = self.symbols.clone();
         self.tuples()
-        // .map(move |tuple| (syms.iter().map(|sym| tuple[symbol_idx(sym)]).collect(), tuple))
-            .map(|tuple| (vec![tuple[0]], tuple))
-            // .arrange_by_key()
+            .map(move |tuple| {
+                let key = syms.iter()
+                    .map(|sym| {
+                        let idx = relation_symbols.iter().position(|&v| *sym == v).unwrap();
+                        tuple[idx]
+                    })
+                    .collect();
+                (key, tuple)
+            })
     }
 }
 
@@ -251,11 +258,6 @@ impl<'a> Relation<'a> for SimpleRelation<'a> {
 // QUERY PLAN IMPLEMENTATION
 //
 // @TODO return handles to modify the parameters of the query
-// @TODO pass a single scope around
-// @TODO output arrangement depends on whatever join comes next,
-// so maybe not do the arrangement in the interpretation of the
-// clause, but in the interpretation of the unification. should be
-// ok, as long as it's all inside a single scope
 
 /// Takes a query plan and turns it into a differential dataflow. The
 /// dataflow is extended to feed output tuples to JS clients. A probe
@@ -294,6 +296,7 @@ fn implement_plan<'a>(plan: &Plan, db: &mut DB, scope: &mut Scope<'a>) -> Simple
                 .arrange_by_key()
                 .join_core(&right.tuples_by_symbols(symbols.clone()).arrange_by_key(), |_key, v1, v2| {
                     // @TODO can haz array here?
+                    // @TODO avoid allocation, if capacity available in v1
                     let mut vstar = Vec::with_capacity(v1.len() + v2.len());
                     
                     vstar.append(&mut (*v1).clone());
@@ -303,7 +306,14 @@ fn implement_plan<'a>(plan: &Plan, db: &mut DB, scope: &mut Scope<'a>) -> Simple
                 });
 
             // @TODO correct symbols here
-            SimpleRelation { symbols, tuples }
+            let mut left_syms = left.symbols().clone();
+            let mut right_syms = right.symbols().clone();
+            let mut rel_symbols: Vec<Var> = Vec::with_capacity(left_syms.len() + right_syms.len());
+
+            rel_symbols.append(&mut left_syms);
+            rel_symbols.append(&mut right_syms);
+            
+            SimpleRelation { symbols: rel_symbols, tuples }
         },
         &Plan::Lookup(e, a, sym1) => {
             let ea_in = scope.new_collection_from(vec![(e, a)]).1.arrange_by_self();
