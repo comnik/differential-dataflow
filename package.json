@@ -1,0 +1,23 @@
+{
+  "private": true,
+  "name": "@ncg/differential",
+  "version": "0.0.0",
+  "description": "WASM Datalog interface to Frank McSherry's Differential Dataflow.",
+  "author": "Nikolas Göbel",
+  "licenses": [
+    {
+      "type": "MIT",
+      "url": "https://github.com/comnik/differential-dataflow/blob/master/LICENSE"
+    }
+  ],
+  "main": "./release-js/differential.js",
+  "repository": {
+    "type": "git",
+    "url": "git@github.com:comnik/differential-dataflow.git"
+  },
+  "engines": {
+      "node": ">=0.8.22"
+  },
+  "dependencies": {},
+  "files": [".babelrc", "release-js"]
+}
