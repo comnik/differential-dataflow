@@ -156,6 +156,7 @@ js_deserializable!(Value);
 #[derive(Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Abomonation, Debug, Serialize, Deserialize)]
 pub struct Datom(Entity, Attribute, Value);
 
+// @TODO This might not even be needed anymore
 js_serializable!(Datom);
 js_deserializable!(Datom);
 
@@ -166,6 +167,11 @@ static DB_RETRACT: u8 = 1;
 pub struct TxData(u8, Entity, Attribute, Value);
 
 js_deserializable!(TxData);
+
+#[derive(Serialize)]
+pub struct Out(Vec<Value>, isize);
+
+js_serializable!(Out);
 
 type Scope<'a> = Child<'a, Root<Allocator>, usize>;
 type RootTime = Product<RootTimestamp, usize>;
@@ -276,9 +282,18 @@ fn implement(plan: Plan, ctx: &mut Context) -> ProbeHandle {
         let mut output_relation = implement_plan(&plan, db, &mut scope);
 
         output_relation.tuples()
-            .inspect(|&(ref tuple, _x, diff)| {
+            // .inspect(|&(ref tuple, _x, diff)| {
+            //     js! {
+            //         __UGLY_DIFF_HOOK(@{tuple}, @{diff as i32}); // @TODO how to get rid of the cast?
+            //     }
+        // })
+            .inspect_batch(move |_t, tuples| {
+                let out: Vec<Out> = tuples.into_iter()
+                    .map(move |x| Out(x.0.clone(), x.2)) // @FRANK why is this still borrowed content?
+                    .collect();
+                
                 js! {
-                    __UGLY_DIFF_HOOK(@{tuple}, @{diff as i32}); // @TODO how to get rid of the cast?
+                    __UGLY_DIFF_HOOK(@{out});
                 }
             })
             .probe()
