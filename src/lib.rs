@@ -131,9 +131,9 @@ use timely::progress::nested::product::Product;
 use timely::execute::{setup_threadless};
 
 use input::{Input, InputSession};
-use trace::implementations::ord::{OrdKeyBatch, OrdValBatch};
+use trace::implementations::ord::{OrdValBatch};
 use trace::implementations::spine::Spine;
-use operators::arrange::{Arranged, ArrangeByKey, ArrangeBySelf, TraceAgent};
+use operators::arrange::{ArrangeByKey, ArrangeBySelf, TraceAgent};
 use operators::join::JoinCore;
 
 //
@@ -158,6 +158,14 @@ pub struct Datom(Entity, Attribute, Value);
 
 js_serializable!(Datom);
 js_deserializable!(Datom);
+
+static DB_ADD: u8 = 0;
+static DB_RETRACT: u8 = 1;
+
+#[derive(Deserialize)]
+pub struct TxData(u8, Entity, Attribute, Value);
+
+js_deserializable!(TxData);
 
 type Scope<'a> = Child<'a, Root<Allocator>, usize>;
 type RootTime = Product<RootTimestamp, usize>;
@@ -268,9 +276,9 @@ fn implement(plan: Plan, ctx: &mut Context) -> ProbeHandle {
         let mut output_relation = implement_plan(&plan, db, &mut scope);
 
         output_relation.tuples()
-            .inspect(|&(ref tuple, _x, _y)| {
+            .inspect(|&(ref tuple, _x, diff)| {
                 js! {
-                    __UGLY_DIFF_HOOK(@{tuple});
+                    __UGLY_DIFF_HOOK(@{tuple}, @{diff as i32}); // @TODO how to get rid of the cast?
                 }
             })
             .probe()
@@ -416,13 +424,19 @@ pub fn register(plan: Plan) -> bool {
 }
 
 #[js_export]
-pub fn send(tx: usize, d: Vec<Datom>) -> bool {
+pub fn transact(tx: usize, d: Vec<TxData>) -> bool {
     unsafe {
         match CTX {
             None => false,
             Some(ref mut ctx) => {
-                for datom in d {
-                    ctx.input_handle.insert(datom);
+                for TxData(op, e, a, v) in d {
+                    if op == DB_ADD {
+                        ctx.input_handle.insert(Datom(e, a, v));
+                    } else if op == DB_RETRACT {
+                        ctx.input_handle.remove(Datom(e, a, v));
+                    } else {
+                        panic!("Unknown operation");
+                    }
                 }
                 ctx.input_handle.advance_to(tx + 1);
                 ctx.input_handle.flush();
@@ -441,3 +455,4 @@ pub fn send(tx: usize, d: Vec<Datom>) -> bool {
         }
     }
 }
+
