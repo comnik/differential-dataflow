@@ -114,6 +114,7 @@ pub mod collection;
 
 use stdweb::js_export;
 
+use std::string::String;
 use std::rc::Rc;
 use std::boxed::Box;
 use std::ops::Deref;
@@ -143,17 +144,18 @@ use operators::join::JoinCore;
 type Entity = u64;
 type Attribute = u32;
 
-#[derive(Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Abomonation, Debug, Serialize, Deserialize)]
+#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Abomonation, Debug, Serialize, Deserialize)]
 pub enum Value {
     Eid(Entity),
     Attribute(Attribute),
     Number(i64),
+    String(String),
 }
 
 js_serializable!(Value);
 js_deserializable!(Value);
 
-#[derive(Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Abomonation, Debug, Serialize, Deserialize)]
+#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Abomonation, Debug, Serialize, Deserialize)]
 pub struct Datom(Entity, Attribute, Value);
 
 // @TODO This might not even be needed anymore
@@ -260,7 +262,7 @@ impl<'a> Relation<'a> for SimpleRelation<'a> {
                 let key = syms.iter()
                     .map(|sym| {
                         let idx = relation_symbols.iter().position(|&v| *sym == v).unwrap();
-                        tuple[idx]
+                        tuple[idx].clone()
                     })
                     .collect();
                 (key, tuple)
@@ -341,9 +343,9 @@ fn implement_plan<'a>(plan: &Plan, db: &mut DB, scope: &mut Scope<'a>) -> Simple
         &Plan::Lookup(e, a, sym1) => {
             let ea_in = scope.new_collection_from(vec![(e, a)]).1.arrange_by_self();
             let tuples = db.ea_v.import(scope)
-                .join_core(&ea_in, |_, &v, _| {
+                .join_core(&ea_in, |_, v, _| {
                     let mut vs: Vec<Value> = Vec::with_capacity(8);
-                    vs.push(v);
+                    vs.push(v.clone());
 
                     Some(vs)
                 });
@@ -353,10 +355,10 @@ fn implement_plan<'a>(plan: &Plan, db: &mut DB, scope: &mut Scope<'a>) -> Simple
         &Plan::Entity(e, sym1, sym2) => {
             let e_in = scope.new_collection_from(vec![e]).1.arrange_by_self();
             let tuples = db.e_av.import(scope)
-                .join_core(&e_in, |_, &(a, v), _| {
+                .join_core(&e_in, |_, &(a, ref v), _| {
                     let mut vs: Vec<Value> = Vec::with_capacity(8);
                     vs.push(Value::Attribute(a));
-                    vs.push(v);
+                    vs.push(v.clone());
 
                     Some(vs)
                 });
@@ -366,18 +368,18 @@ fn implement_plan<'a>(plan: &Plan, db: &mut DB, scope: &mut Scope<'a>) -> Simple
         &Plan::HasAttr(sym1, a, sym2) => {
             let a_in = scope.new_collection_from(vec![a]).1.arrange_by_self();
             let tuples = db.a_ev.import(scope)
-                .join_core(&a_in, |_, &(e, v), _| {
+                .join_core(&a_in, |_, &(e, ref v), _| {
                     let mut vs: Vec<Value> = Vec::with_capacity(8);
                     vs.push(Value::Eid(e));
-                    vs.push(v);
+                    vs.push(v.clone());
                     
                     Some(vs)
                 });
             
             SimpleRelation { symbols: vec![sym1, sym2], tuples }
         },
-        &Plan::Filter(sym1, a, v) => {
-            let av_in = scope.new_collection_from(vec![(a, v)]).1.arrange_by_self();
+        &Plan::Filter(sym1, a, ref v) => {
+            let av_in = scope.new_collection_from(vec![(a, v.clone())]).1.arrange_by_self();
             let tuples = db.av_e.import(scope)
                 .join_core(&av_in, |_, &e, _| {
                     let mut vs: Vec<Value> = Vec::with_capacity(8);
