@@ -437,11 +437,14 @@ Module.STDWEB_PRIVATE.acquire_tmp = function( dummy ) {
             "__extjs_80d6d56760c65e49b7be8b6b01c1ea861b046bf0": function($0) {
                 Module.STDWEB_PRIVATE.decrement_refcount( $0 );
             },
-            "__extjs_ff5103e6cc179d13b4c7a785bdce2708fd559fc0": function($0) {
-                Module.STDWEB_PRIVATE.tmp = Module.STDWEB_PRIVATE.to_js( $0 );
+            "__extjs_dc2fd915bd92f9e9c6a3bd15174f1414eee3dbaf": function() {
+                console.error( 'Encountered a panic!' );
             },
             "__extjs_6ae2f0d3420b3969fbdee9a1a7eba4cef664b99f": function($0) {
                 return (Module.STDWEB_PRIVATE.acquire_js_reference( $0 ) instanceof Object) | 0;
+            },
+            "__extjs_93b9872dc3d816765ab0e68585457a4b8d33560b": function($0) {
+                $0 = Module.STDWEB_PRIVATE.to_js($0);Promise.resolve (). then (function (){($0)();});
             },
             "__extjs_fe1e80bdcfe7f7cb820b64a40f6d286cbd345955": function($0) {
                 return (Module.STDWEB_PRIVATE.acquire_js_reference( $0 ) instanceof Array) | 0;
@@ -449,29 +452,26 @@ Module.STDWEB_PRIVATE.acquire_tmp = function( dummy ) {
             "__extjs_db0226ae1bbecd407e9880ee28ddc70fc3322d9c": function($0) {
                 $0 = Module.STDWEB_PRIVATE.to_js($0);Module.STDWEB_PRIVATE.unregister_raw_value (($0));
             },
-            "__extjs_f814fda503cb20016f78481f85431d48a7c4e731": function($0, $1) {
-                var object = Module.STDWEB_PRIVATE.acquire_js_reference( $0 );Module.STDWEB_PRIVATE.serialize_object( $1, object );
+            "__extjs_3d42d34a093cf3e15f20d8e19813f9e34f2ff6b5": function($0, $1) {
+                $1 = Module.STDWEB_PRIVATE.to_js($1);Module.STDWEB_PRIVATE.from_js($0, (function(){__UGLY_DIFF_HOOK (($1));})());
             },
-            "__extjs_ee41f864457c794c278cdcafc28967ffbac29706": function($0, $1) {
-                $1 = Module.STDWEB_PRIVATE.to_js($1);Module.STDWEB_PRIVATE.from_js($0, (function(){return ($1);})());
+            "__extjs_97495987af1720d8a9a923fa4683a7b683e3acd6": function($0, $1) {
+                console.error( 'Panic error message:', Module.STDWEB_PRIVATE.to_js_string( $0, $1 ) );
             },
             "__extjs_8c32019649bb581b1b742eeedfc410e2bedd56a6": function($0, $1) {
                 var array = Module.STDWEB_PRIVATE.acquire_js_reference( $0 );Module.STDWEB_PRIVATE.serialize_array( $1, array );
             },
-            "__extjs_dc2fd915bd92f9e9c6a3bd15174f1414eee3dbaf": function() {
-                console.error( 'Encountered a panic!' );
+            "__extjs_ee41f864457c794c278cdcafc28967ffbac29706": function($0, $1) {
+                $1 = Module.STDWEB_PRIVATE.to_js($1);Module.STDWEB_PRIVATE.from_js($0, (function(){return ($1);})());
             },
-            "__extjs_3d42d34a093cf3e15f20d8e19813f9e34f2ff6b5": function($0, $1) {
-                $1 = Module.STDWEB_PRIVATE.to_js($1);Module.STDWEB_PRIVATE.from_js($0, (function(){__UGLY_DIFF_HOOK (($1));})());
+            "__extjs_ff5103e6cc179d13b4c7a785bdce2708fd559fc0": function($0) {
+                Module.STDWEB_PRIVATE.tmp = Module.STDWEB_PRIVATE.to_js( $0 );
             },
             "__extjs_72fc447820458c720c68d0d8e078ede631edd723": function($0, $1, $2) {
                 console.error( 'Panic location:', Module.STDWEB_PRIVATE.to_js_string( $0, $1 ) + ':' + $2 );
             },
-            "__extjs_93b9872dc3d816765ab0e68585457a4b8d33560b": function($0) {
-                $0 = Module.STDWEB_PRIVATE.to_js($0);Promise.resolve (). then (function (){($0)();});
-            },
-            "__extjs_97495987af1720d8a9a923fa4683a7b683e3acd6": function($0, $1) {
-                console.error( 'Panic error message:', Module.STDWEB_PRIVATE.to_js_string( $0, $1 ) );
+            "__extjs_f814fda503cb20016f78481f85431d48a7c4e731": function($0, $1) {
+                var object = Module.STDWEB_PRIVATE.acquire_js_reference( $0 );Module.STDWEB_PRIVATE.serialize_object( $1, object );
             },
             "__web_on_grow": function() {
                 const buffer = Module.instance.exports.memory.buffer;
@@ -501,8 +501,8 @@ Module.STDWEB_PRIVATE.acquire_tmp = function( dummy ) {
     return Module.STDWEB_PRIVATE.acquire_tmp(Module.instance.exports.register(Module.STDWEB_PRIVATE.prepare_any_arg(plan)));
 }
 ;
-                Module.exports.send = function send(tx, d) {
-    return Module.STDWEB_PRIVATE.acquire_tmp(Module.instance.exports.send(Module.STDWEB_PRIVATE.prepare_any_arg(tx), Module.STDWEB_PRIVATE.prepare_any_arg(d)));
+                Module.exports.transact = function transact(tx, d) {
+    return Module.STDWEB_PRIVATE.acquire_tmp(Module.instance.exports.transact(Module.STDWEB_PRIVATE.prepare_any_arg(tx), Module.STDWEB_PRIVATE.prepare_any_arg(d)));
 }
 ;
         __imports.env.__web_on_grow();

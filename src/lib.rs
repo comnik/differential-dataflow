@@ -136,7 +136,7 @@ use trace::implementations::ord::{OrdValBatch};
 use trace::implementations::spine::Spine;
 use operators::arrange::{ArrangeByKey, ArrangeBySelf, TraceAgent};
 use operators::group::Threshold;
-use operators::join::JoinCore;
+use operators::join::{Join, JoinCore};
 
 //
 // TYPES
@@ -225,8 +225,9 @@ static mut CTX: Option<Context> = None;
 #[derive(Serialize, Deserialize, Clone)]
 pub enum Plan {
     Project(Box<Plan>, Vec<Var>),
-    Or(Box<Plan>, Box<Plan>),
+    Or(Box<Plan>, Box<Plan>), // @TODO maybe rename Union
     Join(Box<Plan>, Box<Plan>, Var),
+    Not(Box<Plan>),
     Lookup(Entity, Attribute, Var),
     Entity(Entity, Var, Var),
     HasAttr(Var, Attribute, Var),
@@ -276,7 +277,6 @@ impl<'a> Relation<'a> for SimpleRelation<'a> {
 // QUERY PLAN IMPLEMENTATION
 //
 // @TODO return handles to modify the parameters of the query
-// @TODO AND, OR, NOT
 
 /// Takes a query plan and turns it into a differential dataflow. The
 /// dataflow is extended to feed output tuples to JS clients. A probe
@@ -355,6 +355,9 @@ fn implement_plan<'a>(plan: &Plan, db: &mut DB, scope: &mut Scope<'a>) -> Simple
             
             SimpleRelation { symbols: rel_symbols, tuples }
         },
+        &Plan::Not(ref plan) => {
+            implement_negation(plan.deref(), db, scope)
+        },
         &Plan::Lookup(e, a, sym1) => {
             let ea_in = scope.new_collection_from(vec![(e, a)]).1.arrange_by_self();
             let tuples = db.ea_v.import(scope)
@@ -402,9 +405,51 @@ fn implement_plan<'a>(plan: &Plan, db: &mut DB, scope: &mut Scope<'a>) -> Simple
                     
                     Some(vs)
                 });
-                
+            
             SimpleRelation { symbols: vec![sym1], tuples }
         }
+    }
+}
+
+fn implement_negation<'a>(plan: &Plan, db: &mut DB, scope: &mut Scope<'a>) -> SimpleRelation<'a> {
+    match plan {
+        &Plan::Lookup(e, a, sym1) => {
+            let ea_in = scope.new_collection_from(vec![(e, a)]).1;
+            let tuples = db.ea_v.import(scope)
+                .antijoin(&ea_in)
+                .distinct()
+                .map(|(_, v)| { vec![v] });
+            
+            SimpleRelation { symbols: vec![sym1], tuples }
+        },
+        &Plan::Entity(e, sym1, sym2) => {
+            let e_in = scope.new_collection_from(vec![e]).1;
+            let tuples = db.e_av.import(scope)
+                .antijoin(&e_in)
+                .distinct()
+                .map(|(_, (a, v))| { vec![Value::Attribute(a), v] });
+            
+            SimpleRelation { symbols: vec![sym1, sym2], tuples }
+        },
+        &Plan::HasAttr(sym1, a, sym2) => {
+            let a_in = scope.new_collection_from(vec![a]).1;
+            let tuples = db.a_ev.import(scope)
+                .antijoin(&a_in)
+                .distinct()
+                .map(|(_, (e, v))| { vec![Value::Eid(e), v] });
+            
+            SimpleRelation { symbols: vec![sym1, sym2], tuples }
+        },
+        &Plan::Filter(sym1, a, ref v) => {
+            let av_in = scope.new_collection_from(vec![(a, v.clone())]).1;
+            let tuples = db.av_e.import(scope)
+                .antijoin(&av_in)
+                .distinct()
+                .map(|(_, e)| { vec![Value::Eid(e)] });
+                
+            SimpleRelation { symbols: vec![sym1], tuples }
+        },
+        _ => panic!("Negation not supported for this plan.")
     }
 }
 
