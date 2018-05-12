@@ -135,6 +135,7 @@ use input::{Input, InputSession};
 use trace::implementations::ord::{OrdValBatch};
 use trace::implementations::spine::Spine;
 use operators::arrange::{ArrangeByKey, ArrangeBySelf, TraceAgent};
+use operators::group::Threshold;
 use operators::join::JoinCore;
 
 //
@@ -224,6 +225,7 @@ static mut CTX: Option<Context> = None;
 #[derive(Serialize, Deserialize, Clone)]
 pub enum Plan {
     Project(Box<Plan>, Vec<Var>),
+    Or(Box<Plan>, Box<Plan>),
     Join(Box<Plan>, Box<Plan>, Var),
     Lookup(Entity, Attribute, Var),
     Entity(Entity, Var, Var),
@@ -274,6 +276,7 @@ impl<'a> Relation<'a> for SimpleRelation<'a> {
 // QUERY PLAN IMPLEMENTATION
 //
 // @TODO return handles to modify the parameters of the query
+// @TODO AND, OR, NOT
 
 /// Takes a query plan and turns it into a differential dataflow. The
 /// dataflow is extended to feed output tuples to JS clients. A probe
@@ -311,6 +314,18 @@ fn implement_plan<'a>(plan: &Plan, db: &mut DB, scope: &mut Scope<'a>) -> Simple
                 .map(|(key, _tuple)| key);
             
             SimpleRelation { symbols: symbols.to_vec(), tuples }
+        },
+        &Plan::Or(ref left_plan, ref right_plan) => {
+            let mut left = implement_plan(left_plan.deref(), db, scope);
+            let mut right = implement_plan(right_plan.deref(), db, scope);
+
+            SimpleRelation {
+                // @TODO assert that both relations use the same set of symbols
+                symbols: left.symbols().clone(),
+                tuples: left.tuples()
+                    .concat(right.tuples())
+                    .distinct()
+            }
         },
         &Plan::Join(ref left_plan, ref right_plan, join_var) => {
             let mut left = implement_plan(left_plan.deref(), db, scope);
