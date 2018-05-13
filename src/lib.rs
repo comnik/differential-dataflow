@@ -120,23 +120,27 @@ use std::boxed::Box;
 use std::ops::Deref;
 // use std::hash::Hash;
 // use std::cmp::Ordering;
-// use lattice::Lattice;
 
-use timely::{Root, Allocator};
-use timely::dataflow::scopes::Child;
+use timely::{Allocator};
+use timely::dataflow::Scope;
+use timely::dataflow::scopes::{Root, Child};
 // use timely::dataflow::operators::*;
 use timely::dataflow::operators::probe::{Handle};
 // use timely::dataflow::channels::pact::Pipeline;
+use timely::progress::Timestamp;
 use timely::progress::timestamp::RootTimestamp;
 use timely::progress::nested::product::Product;
 use timely::execute::{setup_threadless};
+use timely_communication::Allocate;
 
+use lattice::Lattice;
 use input::{Input, InputSession};
 use trace::implementations::ord::{OrdValBatch};
 use trace::implementations::spine::Spine;
 use operators::arrange::{ArrangeByKey, ArrangeBySelf, TraceAgent};
 use operators::group::Threshold;
-use operators::join::{Join, JoinCore};
+use operators::join::{JoinCore};
+use operators::iterate::Variable;
 
 //
 // TYPES
@@ -176,51 +180,38 @@ pub struct Out(Vec<Value>, isize);
 
 js_serializable!(Out);
 
-type Scope<'a> = Child<'a, Root<Allocator>, usize>;
-type RootTime = Product<RootTimestamp, usize>;
-type ProbeHandle = Handle<RootTime>;
-type InputHandle = InputSession<usize, Datom, isize>;
-// type TraceBatch = OrdValBatch<Value, Value, RootTime, isize>;
-// type TraceSpine = Spine<Value, Value, RootTime, isize, Rc<TraceBatch>>;
-// type TraceHandle = TraceAgent<Value, Value, RootTime, isize, TraceSpine>;
+type ProbeHandle<T> = Handle<Product<RootTimestamp, T>>;
+// type TraceBatch = OrdValBatch<Value, Value, Product<RootTimestamp, T>, isize>;
+// type TraceSpine = Spine<Value, Value, Product<RootTimestamp, T>, isize, Rc<TraceBatch>>;
+// type TraceHandle = TraceAgent<Value, Value, Product<RootTimestamp, T>, isize, TraceSpine>;
 
-// type KeyIndex<K> = TraceAgent<K, (), RootTime, isize,
-//                               Spine<K, (), RootTime, isize,
-//                                     Rc<OrdKeyBatch<K, RootTime, isize>>>>;
+type Index<K, V, T> = TraceAgent<K, V, Product<RootTimestamp, T>, isize,
+                                 Spine<K, V, Product<RootTimestamp, T>, isize,
+                                       Rc<OrdValBatch<K, V, Product<RootTimestamp, T>, isize>>>>;
 
-type Index<K, V> = TraceAgent<K, V, RootTime, isize,
-                              Spine<K, V, RootTime, isize,
-                                    Rc<OrdValBatch<K, V, RootTime, isize>>>>;
-
-// type Arrangement<'a, K, V> = Arranged<Scope<'a>, K, V, isize,
-//                                       TraceAgent<K, V, RootTime, isize,
-//                                                  Spine<K, V, RootTime, isize,
-//                                                        Rc<OrdValBatch<K, V, RootTime, isize>>>>>;
-    
 //
 // CONTEXT
 //
 
-struct DB {
-    e_av: Index<Entity, (Attribute, Value)>,
-    a_ev: Index<Attribute, (Entity, Value)>,
-    ea_v: Index<(Entity, Attribute), Value>,
-    av_e: Index<(Attribute, Value), Entity>,
+struct DB<T: Timestamp+Lattice> {
+    e_av: Index<Entity, (Attribute, Value), T>,
+    a_ev: Index<Attribute, (Entity, Value), T>,
+    ea_v: Index<(Entity, Attribute), Value, T>,
+    av_e: Index<(Attribute, Value), Entity, T>,
 }
 
-pub struct Context {
+pub struct Context<T: Timestamp+Lattice> {
     root: Root<Allocator>,
-    input_handle: InputHandle,
-    db: DB,
-    probe: Option<ProbeHandle>,
+    input_handle: InputSession<T, Datom, isize>,
+    db: DB<T>,
+    probe: Option<ProbeHandle<T>>,
 }
 
-static mut CTX: Option<Context> = None;
+static mut CTX: Option<Context<usize>> = None;
 
 //
 // QUERY PLAN GRAMMAR
 //
-// @TODO how to handle placeholders? maybe just convert them to unique variable names?
 
 #[derive(Serialize, Deserialize, Clone)]
 pub enum Plan {
@@ -243,22 +234,22 @@ type Var = u32;
 // RELATIONS
 //
 
-trait Relation<'a> {
+trait Relation<'a, G: Scope> where G::Timestamp : Lattice {
     fn symbols(&self) -> &Vec<Var>;
-    fn tuples(&mut self) -> &mut Collection<Scope<'a>, Vec<Value>>;
-    fn tuples_by_symbols(&mut self, syms: Vec<Var>) -> Collection<Scope<'a>, (Vec<Value>, Vec<Value>)>;
+    fn tuples(self) -> Collection<G, Vec<Value>, isize>;
+    fn tuples_by_symbols(self, syms: Vec<Var>) -> Collection<G, (Vec<Value>, Vec<Value>), isize>;
 }
 
-struct SimpleRelation<'a> {
+struct SimpleRelation<G: Scope> where G::Timestamp : Lattice {
     symbols: Vec<Var>,
-    tuples: Collection<Scope<'a>, Vec<Value>>,
+    tuples: Collection<G, Vec<Value>, isize>,
 }
 
-impl<'a> Relation<'a> for SimpleRelation<'a> {
+impl<'a, G: Scope> Relation<'a, G> for SimpleRelation<G> where G::Timestamp : Lattice {
     fn symbols(&self) -> &Vec<Var> { &self.symbols }
-    fn tuples(&mut self) -> &mut Collection<Scope<'a>, Vec<Value>> { &mut self.tuples }
+    fn tuples(self) -> Collection<G, Vec<Value>, isize> { self.tuples }
 
-    fn tuples_by_symbols(&mut self, syms: Vec<Var>) -> Collection<Scope<'a>, (Vec<Value>, Vec<Value>)>{
+    fn tuples_by_symbols(self, syms: Vec<Var>) -> Collection<G, (Vec<Value>, Vec<Value>), isize>{
         let relation_symbols = self.symbols.clone();
         self.tuples()
             .map(move |tuple| {
@@ -273,6 +264,30 @@ impl<'a> Relation<'a> for SimpleRelation<'a> {
     }
 }
 
+struct VariableRelation<'a, G: Scope> where G::Timestamp : Lattice {
+    symbols: Vec<Var>,
+    tuples: Variable<'a, G, Vec<Value>, isize>,
+}
+
+impl<'a, G: Scope> Relation<'a, G> for VariableRelation<'a, G> where G::Timestamp : Lattice {
+    fn symbols(&self) -> &Vec<Var> { &self.symbols }
+    fn tuples(self) -> Collection<G, Vec<Value>, isize> { self.tuples.leave() }
+
+    fn tuples_by_symbols(self, syms: Vec<Var>) -> Collection<G, (Vec<Value>, Vec<Value>), isize>{
+        let relation_symbols = self.symbols.clone();
+        self.tuples()
+            .map(move |tuple| {
+                let key = syms.iter()
+                    .map(|sym| {
+                        let idx = relation_symbols.iter().position(|&v| *sym == v).unwrap();
+                        tuple[idx].clone()
+                    })
+                    .collect();
+                (key, tuple)
+            })
+    }
+ }
+
 //
 // QUERY PLAN IMPLEMENTATION
 //
@@ -281,10 +296,10 @@ impl<'a> Relation<'a> for SimpleRelation<'a> {
 /// Takes a query plan and turns it into a differential dataflow. The
 /// dataflow is extended to feed output tuples to JS clients. A probe
 /// on the dataflow is returned.
-fn implement(plan: Plan, ctx: &mut Context) -> ProbeHandle {
+fn implement<T: Timestamp+Lattice>(plan: Plan, ctx: &mut Context<T>) -> ProbeHandle<T> {
     let db = &mut ctx.db;
-    ctx.root.dataflow::<usize, _, _>(|mut scope| {
-        let mut output_relation = implement_plan(&plan, db, &mut scope);
+    ctx.root.dataflow(|scope| {
+        let output_relation = implement_plan(&plan, db, scope);
 
         output_relation.tuples()
             // .inspect(|&(ref tuple, _x, diff)| {
@@ -305,7 +320,7 @@ fn implement(plan: Plan, ctx: &mut Context) -> ProbeHandle {
     })
 }
 
-fn implement_plan<'a>(plan: &Plan, db: &mut DB, scope: &mut Scope<'a>) -> SimpleRelation<'a> {
+fn implement_plan<'a, A: Allocate, T: Timestamp+Lattice>(plan: &Plan, db: &mut DB<T>, scope: &mut Child<'a, Root<A>, T>) -> SimpleRelation<Child<'a, Root<A>, T>> {
     match plan {
         &Plan::Project(ref sub_plan, ref symbols) => {
             let mut relation = implement_plan(sub_plan.deref(), db, scope);
@@ -323,7 +338,7 @@ fn implement_plan<'a>(plan: &Plan, db: &mut DB, scope: &mut Scope<'a>) -> Simple
                 // @TODO assert that both relations use the same set of symbols
                 symbols: left.symbols().clone(),
                 tuples: left.tuples()
-                    .concat(right.tuples())
+                    .concat(&right.tuples())
                     .distinct()
             }
         },
@@ -332,6 +347,14 @@ fn implement_plan<'a>(plan: &Plan, db: &mut DB, scope: &mut Scope<'a>) -> Simple
             let mut right = implement_plan(right_plan.deref(), db, scope);
 
             let symbols = vec![join_var];
+            // @TODO correct symbols here
+            let mut left_syms = left.symbols().clone();
+            let mut right_syms = right.symbols().clone();
+
+            let mut rel_symbols: Vec<Var> = Vec::with_capacity(left_syms.len() + right_syms.len());
+            rel_symbols.append(&mut left_syms);
+            rel_symbols.append(&mut right_syms);
+
             let tuples = left.tuples_by_symbols(symbols.clone())
                 .arrange_by_key()
                 .join_core(&right.tuples_by_symbols(symbols.clone()).arrange_by_key(), |_key, v1, v2| {
@@ -344,14 +367,6 @@ fn implement_plan<'a>(plan: &Plan, db: &mut DB, scope: &mut Scope<'a>) -> Simple
                     
                     Some(vstar)                    
                 });
-
-            // @TODO correct symbols here
-            let mut left_syms = left.symbols().clone();
-            let mut right_syms = right.symbols().clone();
-            let mut rel_symbols: Vec<Var> = Vec::with_capacity(left_syms.len() + right_syms.len());
-
-            rel_symbols.append(&mut left_syms);
-            rel_symbols.append(&mut right_syms);
             
             SimpleRelation { symbols: rel_symbols, tuples }
         },
@@ -468,7 +483,7 @@ pub fn setup() {
     unsafe {
         let mut root = setup_threadless();
         
-        let (input_handle, db) = root.dataflow::<usize,_,_>(|scope| {
+        let (input_handle, db) = root.dataflow(|scope| {
             let (input_handle, datoms) = scope.new_collection::<Datom, isize>();
             let db = DB {
                 e_av: datoms.map(|Datom(e, a, v)| (e, (a, v))).arrange_by_key().trace,
