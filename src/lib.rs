@@ -356,7 +356,13 @@ fn implement_plan<'a>(plan: &Plan, db: &mut DB, scope: &mut Scope<'a>) -> Simple
             SimpleRelation { symbols: rel_symbols, tuples }
         },
         &Plan::Not(ref plan) => {
-            implement_negation(plan.deref(), db, scope)
+            // implement_negation(plan.deref(), db, scope)
+            
+            let mut rel = implement_plan(plan.deref(), db, scope);
+            SimpleRelation {
+                symbols: rel.symbols().clone(),
+                tuples: rel.tuples().negate()
+            }
         },
         &Plan::Lookup(e, a, sym1) => {
             let ea_in = scope.new_collection_from(vec![(e, a)]).1.arrange_by_self();
@@ -411,47 +417,47 @@ fn implement_plan<'a>(plan: &Plan, db: &mut DB, scope: &mut Scope<'a>) -> Simple
     }
 }
 
-fn implement_negation<'a>(plan: &Plan, db: &mut DB, scope: &mut Scope<'a>) -> SimpleRelation<'a> {
-    match plan {
-        &Plan::Lookup(e, a, sym1) => {
-            let ea_in = scope.new_collection_from(vec![(e, a)]).1;
-            let tuples = db.ea_v.import(scope)
-                .antijoin(&ea_in)
-                .distinct()
-                .map(|(_, v)| { vec![v] });
+// fn implement_negation<'a>(plan: &Plan, db: &mut DB, scope: &mut Scope<'a>) -> SimpleRelation<'a> {
+//     match plan {
+//         &Plan::Lookup(e, a, sym1) => {
+//             let ea_in = scope.new_collection_from(vec![(e, a)]).1;
+//             let tuples = db.ea_v.import(scope)
+//                 .antijoin(&ea_in)
+//                 .distinct()
+//                 .map(|(_, v)| { vec![v] });
             
-            SimpleRelation { symbols: vec![sym1], tuples }
-        },
-        &Plan::Entity(e, sym1, sym2) => {
-            let e_in = scope.new_collection_from(vec![e]).1;
-            let tuples = db.e_av.import(scope)
-                .antijoin(&e_in)
-                .distinct()
-                .map(|(_, (a, v))| { vec![Value::Attribute(a), v] });
+//             SimpleRelation { symbols: vec![sym1], tuples }
+//         },
+//         &Plan::Entity(e, sym1, sym2) => {
+//             let e_in = scope.new_collection_from(vec![e]).1;
+//             let tuples = db.e_av.import(scope)
+//                 .antijoin(&e_in)
+//                 .distinct()
+//                 .map(|(_, (a, v))| { vec![Value::Attribute(a), v] });
             
-            SimpleRelation { symbols: vec![sym1, sym2], tuples }
-        },
-        &Plan::HasAttr(sym1, a, sym2) => {
-            let a_in = scope.new_collection_from(vec![a]).1;
-            let tuples = db.a_ev.import(scope)
-                .antijoin(&a_in)
-                .distinct()
-                .map(|(_, (e, v))| { vec![Value::Eid(e), v] });
+//             SimpleRelation { symbols: vec![sym1, sym2], tuples }
+//         },
+//         &Plan::HasAttr(sym1, a, sym2) => {
+//             let a_in = scope.new_collection_from(vec![a]).1;
+//             let tuples = db.a_ev.import(scope)
+//                 .antijoin(&a_in)
+//                 .distinct()
+//                 .map(|(_, (e, v))| { vec![Value::Eid(e), v] });
             
-            SimpleRelation { symbols: vec![sym1, sym2], tuples }
-        },
-        &Plan::Filter(sym1, a, ref v) => {
-            let av_in = scope.new_collection_from(vec![(a, v.clone())]).1;
-            let tuples = db.av_e.import(scope)
-                .antijoin(&av_in)
-                .distinct()
-                .map(|(_, e)| { vec![Value::Eid(e)] });
+//             SimpleRelation { symbols: vec![sym1, sym2], tuples }
+//         },
+//         &Plan::Filter(sym1, a, ref v) => {
+//             let av_in = scope.new_collection_from(vec![(a, v.clone())]).1;
+//             let tuples = db.av_e.import(scope)
+//                 .antijoin(&av_in)
+//                 .distinct()
+//                 .map(|(_, e)| { vec![Value::Eid(e)] });
                 
-            SimpleRelation { symbols: vec![sym1], tuples }
-        },
-        _ => panic!("Negation not supported for this plan.")
-    }
-}
+//             SimpleRelation { symbols: vec![sym1], tuples }
+//         },
+//         _ => panic!("Negation not supported for this plan.")
+//     }
+// }
 
 //
 // PUBLIC API
