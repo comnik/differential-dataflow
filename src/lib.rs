@@ -106,7 +106,7 @@ pub mod difference;
 pub mod collection;
 
 //
-// JS INTEROP
+// DECLARATIVE INTERFACE
 //
 
 #[macro_use] extern crate stdweb;
@@ -118,15 +118,11 @@ use std::string::String;
 use std::rc::Rc;
 use std::boxed::Box;
 use std::ops::Deref;
-// use std::hash::Hash;
-// use std::cmp::Ordering;
 
 use timely::{Allocator};
 use timely::dataflow::Scope;
 use timely::dataflow::scopes::{Root, Child};
-// use timely::dataflow::operators::*;
 use timely::dataflow::operators::probe::{Handle};
-// use timely::dataflow::channels::pact::Pipeline;
 use timely::progress::Timestamp;
 use timely::progress::timestamp::RootTimestamp;
 use timely::progress::nested::product::Product;
@@ -167,11 +163,11 @@ pub struct Datom(Entity, Attribute, Value);
 js_serializable!(Datom);
 js_deserializable!(Datom);
 
-static DB_ADD: u8 = 0;
-static DB_RETRACT: u8 = 1;
+static DB_ADD: isize = 1;
+static DB_RETRACT: isize = -1;
 
 #[derive(Deserialize)]
-pub struct TxData(u8, Entity, Attribute, Value);
+pub struct TxData(isize, Entity, Attribute, Value);
 
 js_deserializable!(TxData);
 
@@ -331,6 +327,8 @@ fn implement_plan<'a, A: Allocate, T: Timestamp+Lattice>(plan: &Plan, db: &mut D
             SimpleRelation { symbols: symbols.to_vec(), tuples }
         },
         &Plan::Or(ref left_plan, ref right_plan) => {
+            // @TODO can just concat more than two + a single distinct
+            // @TODO or move out distinct, except for negation
             let mut left = implement_plan(left_plan.deref(), db, scope);
             let mut right = implement_plan(right_plan.deref(), db, scope);
 
@@ -528,13 +526,7 @@ pub fn transact(tx: usize, d: Vec<TxData>) -> bool {
             None => false,
             Some(ref mut ctx) => {
                 for TxData(op, e, a, v) in d {
-                    if op == DB_ADD {
-                        ctx.input_handle.insert(Datom(e, a, v));
-                    } else if op == DB_RETRACT {
-                        ctx.input_handle.remove(Datom(e, a, v));
-                    } else {
-                        panic!("Unknown operation");
-                    }
+                    ctx.input_handle.update(Datom(e, a, v), op);
                 }
                 ctx.input_handle.advance_to(tx + 1);
                 ctx.input_handle.flush();
