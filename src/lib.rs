@@ -197,7 +197,7 @@ pub struct Context<T: Timestamp+Lattice> {
     root: Root<Allocator>,
     input_handle: InputSession<T, Datom, isize>,
     db: DB<T>,
-    probe: Option<ProbeHandle<T>>,
+    probes: Vec<ProbeHandle<T>>,
 }
 
 static mut CTX: Option<Context<usize>> = None;
@@ -493,7 +493,7 @@ pub fn setup() {
             root,
             db,
             input_handle,
-            probe: None,
+            probes: Vec::with_capacity(10),
         };
 
         CTX = Some(ctx);
@@ -506,7 +506,8 @@ pub fn register(name: String, plan: Plan) -> bool {
         match CTX {
             None => false,
             Some(ref mut ctx) => {
-                ctx.probe = Some(implement(name, plan, ctx));
+                let probe = implement(name, plan, ctx);
+                ctx.probes.push(probe);
                 true
             }
         }
@@ -525,16 +526,13 @@ pub fn transact(tx: usize, d: Vec<TxData>) -> bool {
                 ctx.input_handle.advance_to(tx + 1);
                 ctx.input_handle.flush();
 
-                match ctx.probe {
-                    None => false,
-                    Some(ref mut probe) => {
-                        while probe.less_than(ctx.input_handle.time()) {
-                            ctx.root.step();
-                        }
-
-                        true
+                for probe in &mut ctx.probes {
+                    while probe.less_than(ctx.input_handle.time()) {
+                        ctx.root.step();
                     }
                 }
+
+                true
             }
         }
     }
