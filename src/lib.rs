@@ -163,9 +163,6 @@ pub struct Datom(Entity, Attribute, Value);
 js_serializable!(Datom);
 js_deserializable!(Datom);
 
-static DB_ADD: isize = 1;
-static DB_RETRACT: isize = -1;
-
 #[derive(Deserialize)]
 pub struct TxData(isize, Entity, Attribute, Value);
 
@@ -292,31 +289,30 @@ impl<'a, G: Scope> Relation<'a, G> for VariableRelation<'a, G> where G::Timestam
 /// Takes a query plan and turns it into a differential dataflow. The
 /// dataflow is extended to feed output tuples to JS clients. A probe
 /// on the dataflow is returned.
-fn implement<T: Timestamp+Lattice>(plan: Plan, ctx: &mut Context<T>) -> ProbeHandle<T> {
+fn implement<T: Timestamp+Lattice>(name: String, plan: Plan, ctx: &mut Context<T>) -> ProbeHandle<T> {
     let db = &mut ctx.db;
-    ctx.root.dataflow(|scope| {
-        let output_relation = implement_plan(&plan, db, scope);
+    ctx.root.dataflow(move |scope| {
+        // scope.scoped(|nested| {
+            let output_relation = implement_plan(&plan, db, scope);
 
-        output_relation.tuples()
-            // .inspect(|&(ref tuple, _x, diff)| {
-            //     js! {
-            //         __UGLY_DIFF_HOOK(@{tuple}, @{diff as i32}); // @TODO how to get rid of the cast?
-            //     }
+            output_relation.tuples()
+                .inspect_batch(move |_t, tuples| {
+                    let out: Vec<Out> = tuples.into_iter()
+                        .map(move |x| Out(x.0.clone(), x.2)) // @FRANK why is this still borrowed content?
+                        .collect();
+                    
+                    js! {
+                        __UGLY_DIFF_HOOK(@{&name}, @{out});
+                    }
+                })
+                .probe()
         // })
-            .inspect_batch(move |_t, tuples| {
-                let out: Vec<Out> = tuples.into_iter()
-                    .map(move |x| Out(x.0.clone(), x.2)) // @FRANK why is this still borrowed content?
-                    .collect();
-                
-                js! {
-                    __UGLY_DIFF_HOOK(@{out});
-                }
-            })
-            .probe()
     })
 }
 
-fn implement_plan<'a, A: Allocate, T: Timestamp+Lattice>(plan: &Plan, db: &mut DB<T>, scope: &mut Child<'a, Root<A>, T>) -> SimpleRelation<Child<'a, Root<A>, T>> {
+fn implement_plan<'a, A: Allocate, T: Timestamp+Lattice>
+    (plan: &Plan, db: &mut DB<T>, scope: &mut Child<'a, Root<A>, T>) -> SimpleRelation<Child<'a, Root<A>, T>> {
+        
     match plan {
         &Plan::Project(ref sub_plan, ref symbols) => {
             let mut relation = implement_plan(sub_plan.deref(), db, scope);
@@ -505,14 +501,12 @@ pub fn setup() {
 }
 
 #[js_export]
-pub fn register(plan: Plan) -> bool {
-    // @TODO take a string key to distinguish output callbacks
-    
+pub fn register(name: String, plan: Plan) -> bool {
     unsafe {
         match CTX {
             None => false,
             Some(ref mut ctx) => {
-                ctx.probe = Some(implement(plan, ctx));
+                ctx.probe = Some(implement(name, plan, ctx));
                 true
             }
         }
