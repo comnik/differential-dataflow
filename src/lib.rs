@@ -118,10 +118,12 @@ use std::string::String;
 use std::rc::Rc;
 use std::boxed::Box;
 use std::ops::Deref;
+use std::collections::HashMap;
 
 use timely::{Allocator};
-use timely::dataflow::Scope;
+use timely::dataflow::{Scope, ScopeParent};
 use timely::dataflow::scopes::{Root, Child};
+use timely::dataflow::operators::Leave;
 use timely::dataflow::operators::probe::{Handle};
 use timely::progress::Timestamp;
 use timely::progress::timestamp::RootTimestamp;
@@ -131,9 +133,9 @@ use timely_communication::Allocate;
 
 use lattice::Lattice;
 use input::{Input, InputSession};
-use trace::implementations::ord::{OrdValBatch};
+use trace::implementations::ord::{OrdValBatch, OrdValSpine, OrdKeySpine};
 use trace::implementations::spine::Spine;
-use operators::arrange::{ArrangeByKey, ArrangeBySelf, TraceAgent};
+use operators::arrange::{ArrangeByKey, ArrangeBySelf, TraceAgent, Arranged};
 use operators::group::Threshold;
 use operators::join::{JoinCore};
 use operators::iterate::Variable;
@@ -173,34 +175,53 @@ pub struct Out(Vec<Value>, isize);
 
 js_serializable!(Out);
 
-type ProbeHandle<T> = Handle<Product<RootTimestamp, T>>;
 // type TraceBatch = OrdValBatch<Value, Value, Product<RootTimestamp, T>, isize>;
 // type TraceSpine = Spine<Value, Value, Product<RootTimestamp, T>, isize, Rc<TraceBatch>>;
 // type TraceHandle = TraceAgent<Value, Value, Product<RootTimestamp, T>, isize, TraceSpine>;
 
-type Index<K, V, T> = TraceAgent<K, V, Product<RootTimestamp, T>, isize,
-                                 Spine<K, V, Product<RootTimestamp, T>, isize,
-                                       Rc<OrdValBatch<K, V, Product<RootTimestamp, T>, isize>>>>;
+type ProbeHandle<T> = Handle<Product<RootTimestamp, T>>;
+type TraceKeyHandle<K, T, R> = TraceAgent<K, (), T, R, OrdKeySpine<K, T, R>>;
+type TraceValHandle<K, V, T, R> = TraceAgent<K, V, T, R, OrdValSpine<K, V, T, R>>;
+type Arrange<G: Scope, K, V, R> = Arranged<G, K, V, R, TraceValHandle<K, V, G::Timestamp, R>>;
+type ArrangeSelf<G: Scope, K, R> = Arranged<G, K, (), R, TraceKeyHandle<K, G::Timestamp, R>>;
+type InputMap<'a, G: Scope> = HashMap<(Option<Entity>, Option<Attribute>, Option<Value>), ArrangeSelf<G, Vec<Value>, isize>>;
+type QueryMap<T, R> = HashMap<String, TraceKeyHandle<Vec<Value>, Product<RootTimestamp, T>, R>>;
+type VariableMap<'a, G> = HashMap<String, VariableRelation<'a, G>>;
 
 //
 // CONTEXT
 //
 
 struct DB<T: Timestamp+Lattice> {
-    e_av: Index<Entity, (Attribute, Value), T>,
-    a_ev: Index<Attribute, (Entity, Value), T>,
-    ea_v: Index<(Entity, Attribute), Value, T>,
-    av_e: Index<(Attribute, Value), Entity, T>,
+    e_av: TraceValHandle<Vec<Value>, Vec<Value>, Product<RootTimestamp, T>, isize>,
+    a_ev: TraceValHandle<Vec<Value>, Vec<Value>, Product<RootTimestamp, T>, isize>,
+    ea_v: TraceValHandle<Vec<Value>, Vec<Value>, Product<RootTimestamp, T>, isize>,
+    av_e: TraceValHandle<Vec<Value>, Vec<Value>, Product<RootTimestamp, T>, isize>,
 }
 
-pub struct Context<T: Timestamp+Lattice> {
-    root: Root<Allocator>,
+struct ImplContext<'a, G: ScopeParent, T: Timestamp+Lattice> where G::Timestamp : Lattice {
+    // Imported traces
+    e_av: Arrange<Child<'a, G, T>, Vec<Value>, Vec<Value>, isize>,
+    a_ev: Arrange<Child<'a, G, T>, Vec<Value>, Vec<Value>, isize>,
+    ea_v: Arrange<Child<'a, G, T>, Vec<Value>, Vec<Value>, isize>,
+    av_e: Arrange<Child<'a, G, T>, Vec<Value>, Vec<Value>, isize>,
+
+    // Parameter inputs
+    input_map: InputMap<'a, Child<'a, G, T>>,
+    
+    // Collection variables for recursion
+    // vars: HashMap<String, VariableRelation<'a, Child<'a, G, T>>>,
+}
+
+pub struct Context<A: Allocate, T: Timestamp+Lattice> {
+    root: Root<A>,
     input_handle: InputSession<T, Datom, isize>,
     db: DB<T>,
     probes: Vec<ProbeHandle<T>>,
+    queries: QueryMap<T, isize>,
 }
 
-static mut CTX: Option<Context<usize>> = None;
+static mut CTX: Option<Context<Allocator, usize>> = None;
 
 //
 // QUERY PLAN GRAMMAR
@@ -215,7 +236,8 @@ pub enum Plan {
     Lookup(Entity, Attribute, Var),
     Entity(Entity, Var, Var),
     HasAttr(Var, Attribute, Var),
-    Filter(Var, Attribute, Value)
+    Filter(Var, Attribute, Value),
+    // Recur(Vec<Var>),
 }
 
 js_serializable!(Plan);
@@ -231,6 +253,11 @@ trait Relation<'a, G: Scope> where G::Timestamp : Lattice {
     fn symbols(&self) -> &Vec<Var>;
     fn tuples(self) -> Collection<G, Vec<Value>, isize>;
     fn tuples_by_symbols(self, syms: Vec<Var>) -> Collection<G, (Vec<Value>, Vec<Value>), isize>;
+}
+
+struct RelationHandles<T: Timestamp+Lattice> {
+    input: InputSession<T, Vec<Value>, isize>,
+    trace: TraceKeyHandle<Vec<Value>, Product<RootTimestamp, T>, isize>,
 }
 
 struct SimpleRelation<G: Scope> where G::Timestamp : Lattice {
@@ -284,38 +311,106 @@ impl<'a, G: Scope> Relation<'a, G> for VariableRelation<'a, G> where G::Timestam
 //
 // QUERY PLAN IMPLEMENTATION
 //
-// @TODO return handles to modify the parameters of the query
 
 /// Takes a query plan and turns it into a differential dataflow. The
 /// dataflow is extended to feed output tuples to JS clients. A probe
 /// on the dataflow is returned.
-fn implement<T: Timestamp+Lattice>(name: String, plan: Plan, ctx: &mut Context<T>) -> ProbeHandle<T> {
+fn implement<A: Allocate, T: Timestamp+Lattice> (name: String, plan: Plan, ctx: &mut Context<A, T>) -> ProbeHandle<T> {
+        
     let db = &mut ctx.db;
+    let queries = &mut ctx.queries;
+    
     ctx.root.dataflow(move |scope| {
-        // scope.scoped(|nested| {
-            let output_relation = implement_plan(&plan, db, scope);
+        // @TODO Only import those we need for the query?
+        let impl_ctx = ImplContext {
+            e_av: db.e_av.import(scope),
+            a_ev: db.a_ev.import(scope),
+            ea_v: db.ea_v.import(scope),
+            av_e: db.av_e.import(scope),
 
-            output_relation.tuples()
-                .inspect_batch(move |_t, tuples| {
-                    let out: Vec<Out> = tuples.into_iter()
-                        .map(move |x| Out(x.0.clone(), x.2)) // @FRANK why is this still borrowed content?
-                        .collect();
-                    
-                    js! {
-                        __UGLY_DIFF_HOOK(@{&name}, @{out});
-                    }
-                })
-                .probe()
-        // })
+            input_map: create_inputs(&plan, scope),
+            // vars: HashMap::new(),
+        };
+
+        let output_collection = scope.scoped(|nested| {
+            let output_relation = implement_plan(&plan, &impl_ctx, nested, queries);
+            output_relation.tuples().distinct().leave()
+        });
+
+        // queries.insert(name.clone(), output_collection.arrange_by_self().trace);
+        
+        output_collection
+            .inspect_batch(move |_t, tuples| {
+                let out: Vec<Out> = tuples.into_iter()
+                    .map(move |x| Out(x.0.clone(), x.2))
+                    .collect();
+                
+                js! {
+                    __UGLY_DIFF_HOOK(@{&name}, @{out});
+                }
+            })
+            .probe()
     })
 }
 
-fn implement_plan<'a, A: Allocate, T: Timestamp+Lattice>
-    (plan: &Plan, db: &mut DB<T>, scope: &mut Child<'a, Root<A>, T>) -> SimpleRelation<Child<'a, Root<A>, T>> {
+fn create_inputs<'a, A: Allocate, T: Timestamp+Lattice>
+(plan: &Plan, scope: &mut Child<'a, Root<A>, T>) -> InputMap<'a, Child<'a, Root<A>, T>> {
+
+    match plan {
+        &Plan::Project(ref plan, _) => { create_inputs(plan.deref(), scope) },
+        &Plan::Or(ref left_plan, ref right_plan) => {
+            let mut left_inputs = create_inputs(left_plan.deref(), scope);
+            let mut right_inputs = create_inputs(right_plan.deref(), scope);
+            
+            for (k, v) in right_inputs.drain() {
+                left_inputs.insert(k, v);
+            }
+
+            left_inputs
+        },
+        &Plan::Join(ref left_plan, ref right_plan, _) => {
+            let mut left_inputs = create_inputs(left_plan.deref(), scope);
+            let mut right_inputs = create_inputs(right_plan.deref(), scope);
+            
+            for (k, v) in right_inputs.drain() {
+                left_inputs.insert(k, v);
+            }
+
+            left_inputs
+        },
+        &Plan::Not(ref plan) => { create_inputs(plan.deref(), scope) },
+        &Plan::Lookup(e, a, _) => {
+            let mut inputs = HashMap::new();
+            inputs.insert((Some(e), Some(a), None), scope.new_collection_from(vec![vec![Value::Eid(e), Value::Attribute(a)]]).1.arrange_by_self());
+            inputs
+        },
+        &Plan::Entity(e, _, _) => {
+            let mut inputs = HashMap::new();
+            inputs.insert((Some(e), None, None), scope.new_collection_from(vec![vec![Value::Eid(e)]]).1.arrange_by_self());
+            inputs
+        },
+        &Plan::HasAttr(_, a, _) => {
+            let mut inputs = HashMap::new();
+            inputs.insert((None, Some(a), None), scope.new_collection_from(vec![vec![Value::Attribute(a)]]).1.arrange_by_self());
+            inputs
+        },
+        &Plan::Filter(_, a, ref v) => {
+            let mut inputs = HashMap::new();
+            inputs.insert((None, Some(a), Some(v.clone())), scope.new_collection_from(vec![vec![Value::Attribute(a), v.clone()]]).1.arrange_by_self());
+            inputs
+        }
+    }
+}
+
+fn implement_plan<'a, 'b, A: Allocate, T: Timestamp+Lattice>
+    (plan: &Plan,
+     db: &ImplContext<'a, Root<A>, T>,
+     nested: &mut Child<'b, Child<'a, Root<A>, T>, T>,
+     queries: &QueryMap<T, isize>) -> SimpleRelation<Child<'b, Child<'a, Root<A>, T>, T>> {
         
     match plan {
-        &Plan::Project(ref sub_plan, ref symbols) => {
-            let mut relation = implement_plan(sub_plan.deref(), db, scope);
+        &Plan::Project(ref plan, ref symbols) => {
+            let mut relation = implement_plan(plan.deref(), db, nested, queries);
             let tuples = relation
                 .tuples_by_symbols(symbols.clone())
                 .map(|(key, _tuple)| key);
@@ -325,8 +420,8 @@ fn implement_plan<'a, A: Allocate, T: Timestamp+Lattice>
         &Plan::Or(ref left_plan, ref right_plan) => {
             // @TODO can just concat more than two + a single distinct
             // @TODO or move out distinct, except for negation
-            let mut left = implement_plan(left_plan.deref(), db, scope);
-            let mut right = implement_plan(right_plan.deref(), db, scope);
+            let mut left = implement_plan(left_plan.deref(), db, nested, queries);
+            let mut right = implement_plan(right_plan.deref(), db, nested, queries);
 
             SimpleRelation {
                 // @TODO assert that both relations use the same set of symbols
@@ -337,8 +432,8 @@ fn implement_plan<'a, A: Allocate, T: Timestamp+Lattice>
             }
         },
         &Plan::Join(ref left_plan, ref right_plan, join_var) => {
-            let mut left = implement_plan(left_plan.deref(), db, scope);
-            let mut right = implement_plan(right_plan.deref(), db, scope);
+            let mut left = implement_plan(left_plan.deref(), db, nested, queries);
+            let mut right = implement_plan(right_plan.deref(), db, nested, queries);
 
             let symbols = vec![join_var];
             // @TODO correct symbols here
@@ -365,64 +460,49 @@ fn implement_plan<'a, A: Allocate, T: Timestamp+Lattice>
             SimpleRelation { symbols: rel_symbols, tuples }
         },
         &Plan::Not(ref plan) => {
-            // implement_negation(plan.deref(), db, scope)
+            // implement_negation(plan.deref(), db)
             
-            let mut rel = implement_plan(plan.deref(), db, scope);
+            let mut rel = implement_plan(plan.deref(), db, nested, queries);
             SimpleRelation {
                 symbols: rel.symbols().clone(),
                 tuples: rel.tuples().negate()
             }
         },
         &Plan::Lookup(e, a, sym1) => {
-            let ea_in = scope.new_collection_from(vec![(e, a)]).1.arrange_by_self();
-            let tuples = db.ea_v.import(scope)
-                .join_core(&ea_in, |_, v, _| {
-                    let mut vs: Vec<Value> = Vec::with_capacity(8);
-                    vs.push(v.clone());
-
-                    Some(vs)
-                });
+            // let ea_in = scope.new_collection_from(vec![(e, a)]).1.enter(nested).arrange_by_self();
+            let ea_in = db.input_map.get(&(Some(e), Some(a), None)).unwrap().enter(nested);
+            let tuples = db.ea_v.enter(nested)
+                .join_core(&ea_in, |_, tuple, _| { Some(tuple.clone()) });
             
             SimpleRelation { symbols: vec![sym1], tuples }
         },
         &Plan::Entity(e, sym1, sym2) => {
-            let e_in = scope.new_collection_from(vec![e]).1.arrange_by_self();
-            let tuples = db.e_av.import(scope)
-                .join_core(&e_in, |_, &(a, ref v), _| {
-                    let mut vs: Vec<Value> = Vec::with_capacity(8);
-                    vs.push(Value::Attribute(a));
-                    vs.push(v.clone());
-
-                    Some(vs)
-                });
+            // let e_in = scope.new_collection_from(vec![e]).1.enter(nested).arrange_by_self();
+            let e_in = db.input_map.get(&(Some(e), None, None)).unwrap().enter(nested);
+            let tuples = db.e_av.enter(nested)
+                .join_core(&e_in, |_, tuple, _| { Some(tuple.clone()) });
             
             SimpleRelation { symbols: vec![sym1, sym2], tuples }
         },
         &Plan::HasAttr(sym1, a, sym2) => {
-            let a_in = scope.new_collection_from(vec![a]).1.arrange_by_self();
-            let tuples = db.a_ev.import(scope)
-                .join_core(&a_in, |_, &(e, ref v), _| {
-                    let mut vs: Vec<Value> = Vec::with_capacity(8);
-                    vs.push(Value::Eid(e));
-                    vs.push(v.clone());
-                    
-                    Some(vs)
-                });
+            // let a_in = scope.new_collection_from(vec![a]).1.enter(nested).arrange_by_self();
+            let a_in = db.input_map.get(&(None, Some(a), None)).unwrap().enter(nested);
+            let tuples = db.a_ev.enter(nested)
+                .join_core(&a_in, |_, tuple, _| { Some(tuple.clone()) });
             
             SimpleRelation { symbols: vec![sym1, sym2], tuples }
         },
         &Plan::Filter(sym1, a, ref v) => {
-            let av_in = scope.new_collection_from(vec![(a, v.clone())]).1.arrange_by_self();
-            let tuples = db.av_e.import(scope)
-                .join_core(&av_in, |_, &e, _| {
-                    let mut vs: Vec<Value> = Vec::with_capacity(8);
-                    vs.push(Value::Eid(e));
-                    
-                    Some(vs)
-                });
+            // let av_in = scope.new_collection_from(vec![(a, v.clone())]).1.enter(nested).arrange_by_self();
+            let av_in = db.input_map.get(&(None, Some(a), Some(v.clone()))).unwrap().enter(nested);
+            let tuples = db.av_e.enter(nested)
+                .join_core(&av_in, |_, tuple, _| { Some(tuple.clone()) });
             
             SimpleRelation { symbols: vec![sym1], tuples }
         }
+        // &Plan::Recur(syms) => {
+            
+        // }
     }
 }
 
@@ -480,10 +560,10 @@ pub fn setup() {
         let (input_handle, db) = root.dataflow(|scope| {
             let (input_handle, datoms) = scope.new_collection::<Datom, isize>();
             let db = DB {
-                e_av: datoms.map(|Datom(e, a, v)| (e, (a, v))).arrange_by_key().trace,
-                a_ev: datoms.map(|Datom(e, a, v)| (a, (e, v))).arrange_by_key().trace,
-                ea_v: datoms.map(|Datom(e, a, v)| ((e, a), v)).arrange_by_key().trace,
-                av_e: datoms.map(|Datom(e, a, v)| ((a, v), e)).arrange_by_key().trace,
+                e_av: datoms.map(|Datom(e, a, v)| (vec![Value::Eid(e)], vec![Value::Attribute(a), v])).arrange_by_key().trace,
+                a_ev: datoms.map(|Datom(e, a, v)| (vec![Value::Attribute(a)], vec![Value::Eid(e), v])).arrange_by_key().trace,
+                ea_v: datoms.map(|Datom(e, a, v)| (vec![Value::Eid(e), Value::Attribute(a)], vec![v])).arrange_by_key().trace,
+                av_e: datoms.map(|Datom(e, a, v)| (vec![Value::Attribute(a), v], vec![Value::Eid(e)])).arrange_by_key().trace,
             };
 
             (input_handle, db)
@@ -494,6 +574,7 @@ pub fn setup() {
             db,
             input_handle,
             probes: Vec::with_capacity(10),
+            queries: HashMap::new(),
         };
 
         CTX = Some(ctx);
