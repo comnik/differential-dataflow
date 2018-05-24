@@ -115,7 +115,6 @@ pub mod collection;
 use stdweb::js_export;
 
 use std::string::String;
-use std::rc::Rc;
 use std::boxed::Box;
 use std::ops::Deref;
 use std::collections::HashMap;
@@ -123,7 +122,6 @@ use std::collections::HashMap;
 use timely::{Allocator};
 use timely::dataflow::{Scope, ScopeParent};
 use timely::dataflow::scopes::{Root, Child};
-use timely::dataflow::operators::Leave;
 use timely::dataflow::operators::probe::{Handle};
 use timely::progress::Timestamp;
 use timely::progress::timestamp::RootTimestamp;
@@ -133,12 +131,12 @@ use timely_communication::Allocate;
 
 use lattice::Lattice;
 use input::{Input, InputSession};
-use trace::implementations::ord::{OrdValBatch, OrdValSpine, OrdKeySpine};
-use trace::implementations::spine::Spine;
+use trace::implementations::ord::{OrdValSpine, OrdKeySpine};
 use operators::arrange::{ArrangeByKey, ArrangeBySelf, TraceAgent, Arranged};
 use operators::group::Threshold;
 use operators::join::{JoinCore};
 use operators::iterate::Variable;
+use operators::consolidate::Consolidate;
 
 //
 // TYPES
@@ -175,18 +173,14 @@ pub struct Out(Vec<Value>, isize);
 
 js_serializable!(Out);
 
-// type TraceBatch = OrdValBatch<Value, Value, Product<RootTimestamp, T>, isize>;
-// type TraceSpine = Spine<Value, Value, Product<RootTimestamp, T>, isize, Rc<TraceBatch>>;
-// type TraceHandle = TraceAgent<Value, Value, Product<RootTimestamp, T>, isize, TraceSpine>;
-
 type ProbeHandle<T> = Handle<Product<RootTimestamp, T>>;
 type TraceKeyHandle<K, T, R> = TraceAgent<K, (), T, R, OrdKeySpine<K, T, R>>;
 type TraceValHandle<K, V, T, R> = TraceAgent<K, V, T, R, OrdValSpine<K, V, T, R>>;
 type Arrange<G: Scope, K, V, R> = Arranged<G, K, V, R, TraceValHandle<K, V, G::Timestamp, R>>;
 type ArrangeSelf<G: Scope, K, R> = Arranged<G, K, (), R, TraceKeyHandle<K, G::Timestamp, R>>;
-type InputMap<'a, G: Scope> = HashMap<(Option<Entity>, Option<Attribute>, Option<Value>), ArrangeSelf<G, Vec<Value>, isize>>;
+type InputMap<G: Scope> = HashMap<(Option<Entity>, Option<Attribute>, Option<Value>), ArrangeSelf<G, Vec<Value>, isize>>;
 type QueryMap<T, R> = HashMap<String, TraceKeyHandle<Vec<Value>, Product<RootTimestamp, T>, R>>;
-type VariableMap<'a, G> = HashMap<String, VariableRelation<'a, G>>;
+type VariableMap<'a, G> = HashMap<String, SimpleRelation<'a, G>>;
 
 //
 // CONTEXT
@@ -199,18 +193,18 @@ struct DB<T: Timestamp+Lattice> {
     av_e: TraceValHandle<Vec<Value>, Vec<Value>, Product<RootTimestamp, T>, isize>,
 }
 
-struct ImplContext<'a, G: ScopeParent, T: Timestamp+Lattice> where G::Timestamp : Lattice {
+struct ImplContext<G: Scope + ScopeParent> where G::Timestamp : Lattice {
     // Imported traces
-    e_av: Arrange<Child<'a, G, T>, Vec<Value>, Vec<Value>, isize>,
-    a_ev: Arrange<Child<'a, G, T>, Vec<Value>, Vec<Value>, isize>,
-    ea_v: Arrange<Child<'a, G, T>, Vec<Value>, Vec<Value>, isize>,
-    av_e: Arrange<Child<'a, G, T>, Vec<Value>, Vec<Value>, isize>,
+    e_av: Arrange<G, Vec<Value>, Vec<Value>, isize>,
+    a_ev: Arrange<G, Vec<Value>, Vec<Value>, isize>,
+    ea_v: Arrange<G, Vec<Value>, Vec<Value>, isize>,
+    av_e: Arrange<G, Vec<Value>, Vec<Value>, isize>,
 
     // Parameter inputs
-    input_map: InputMap<'a, Child<'a, G, T>>,
+    input_map: InputMap<G>,
     
     // Collection variables for recursion
-    // vars: HashMap<String, VariableRelation<'a, Child<'a, G, T>>>,
+    // variable_map: VariableMap<'a, G>,
 }
 
 pub struct Context<A: Allocate, T: Timestamp+Lattice> {
@@ -251,8 +245,8 @@ type Var = u32;
 
 trait Relation<'a, G: Scope> where G::Timestamp : Lattice {
     fn symbols(&self) -> &Vec<Var>;
-    fn tuples(self) -> Collection<G, Vec<Value>, isize>;
-    fn tuples_by_symbols(self, syms: Vec<Var>) -> Collection<G, (Vec<Value>, Vec<Value>), isize>;
+    fn tuples(self) -> Collection<Child<'a, G, u64>, Vec<Value>, isize>;
+    fn tuples_by_symbols(self, syms: Vec<Var>) -> Collection<Child<'a, G, u64>, (Vec<Value>, Vec<Value>), isize>;
 }
 
 struct RelationHandles<T: Timestamp+Lattice> {
@@ -260,16 +254,16 @@ struct RelationHandles<T: Timestamp+Lattice> {
     trace: TraceKeyHandle<Vec<Value>, Product<RootTimestamp, T>, isize>,
 }
 
-struct SimpleRelation<G: Scope> where G::Timestamp : Lattice {
+struct SimpleRelation<'a, G: Scope> where G::Timestamp : Lattice {
     symbols: Vec<Var>,
-    tuples: Collection<G, Vec<Value>, isize>,
+    tuples: Collection<Child<'a, G, u64>, Vec<Value>, isize>,
 }
 
-impl<'a, G: Scope> Relation<'a, G> for SimpleRelation<G> where G::Timestamp : Lattice {
+impl<'a, G: Scope> Relation<'a, G> for SimpleRelation<'a, G> where G::Timestamp : Lattice {
     fn symbols(&self) -> &Vec<Var> { &self.symbols }
-    fn tuples(self) -> Collection<G, Vec<Value>, isize> { self.tuples }
+    fn tuples(self) -> Collection<Child<'a, G, u64>, Vec<Value>, isize> { self.tuples }
 
-    fn tuples_by_symbols(self, syms: Vec<Var>) -> Collection<G, (Vec<Value>, Vec<Value>), isize>{
+    fn tuples_by_symbols(self, syms: Vec<Var>) -> Collection<Child<'a, G, u64>, (Vec<Value>, Vec<Value>), isize>{
         let relation_symbols = self.symbols.clone();
         self.tuples()
             .map(move |tuple| {
@@ -284,29 +278,31 @@ impl<'a, G: Scope> Relation<'a, G> for SimpleRelation<G> where G::Timestamp : La
     }
 }
 
-struct VariableRelation<'a, G: Scope> where G::Timestamp : Lattice {
-    symbols: Vec<Var>,
-    tuples: Variable<'a, G, Vec<Value>, isize>,
+struct NamedRelation<'a, G: Scope> where G::Timestamp : Lattice {
+    variable: Option<Variable<'a, G, Vec<Value>, isize>>,
+    tuples: Collection<Child<'a, G, u64>, Vec<Value>, isize>,
 }
 
-impl<'a, G: Scope> Relation<'a, G> for VariableRelation<'a, G> where G::Timestamp : Lattice {
-    fn symbols(&self) -> &Vec<Var> { &self.symbols }
-    fn tuples(self) -> Collection<G, Vec<Value>, isize> { self.tuples.leave() }
-
-    fn tuples_by_symbols(self, syms: Vec<Var>) -> Collection<G, (Vec<Value>, Vec<Value>), isize>{
-        let relation_symbols = self.symbols.clone();
-        self.tuples()
-            .map(move |tuple| {
-                let key = syms.iter()
-                    .map(|sym| {
-                        let idx = relation_symbols.iter().position(|&v| *sym == v).unwrap();
-                        tuple[idx].clone()
-                    })
-                    .collect();
-                (key, tuple)
-            })
+impl<'a, G: Scope> NamedRelation<'a, G> where G::Timestamp : Lattice {
+    pub fn from (source: &Collection<Child<'a, G, u64>, Vec<Value>, isize>) -> Self {
+        let variable = Variable::from(source.clone());
+        NamedRelation {
+            variable: Some(variable),
+            tuples: source.clone(),
+        }
     }
- }
+    pub fn add_execution(&mut self, execution: &Collection<Child<'a, G, u64>, Vec<Value>, isize>) {
+        self.tuples = self.tuples.concat(execution);
+    }
+}
+
+impl<'a, G: Scope> Drop for NamedRelation<'a, G> where G::Timestamp : Lattice {
+    fn drop(&mut self) {
+        if let Some(variable) = self.variable.take() {
+            variable.set(&self.tuples.distinct());
+        }
+    }
+}
 
 //
 // QUERY PLAN IMPLEMENTATION
@@ -315,46 +311,49 @@ impl<'a, G: Scope> Relation<'a, G> for VariableRelation<'a, G> where G::Timestam
 /// Takes a query plan and turns it into a differential dataflow. The
 /// dataflow is extended to feed output tuples to JS clients. A probe
 /// on the dataflow is returned.
-fn implement<A: Allocate, T: Timestamp+Lattice> (name: String, plan: Plan, ctx: &mut Context<A, T>) -> ProbeHandle<T> {
+fn implement<A: Allocate, T: Timestamp+Lattice>
+(name: &String, plan: Plan, ctx: &mut Context<A, T>) -> HashMap<String, RelationHandles<T>> {
         
     let db = &mut ctx.db;
     let queries = &mut ctx.queries;
-    
+        
     ctx.root.dataflow(move |scope| {
         // @TODO Only import those we need for the query?
-        let impl_ctx = ImplContext {
+        let impl_ctx: ImplContext<Child<Root<A>, T>> = ImplContext {
             e_av: db.e_av.import(scope),
             a_ev: db.a_ev.import(scope),
             ea_v: db.ea_v.import(scope),
             av_e: db.av_e.import(scope),
 
-            input_map: create_inputs(&plan, scope),
-            // vars: HashMap::new(),
+            input_map: create_inputs(&plan, scope)
         };
 
-        let output_collection = scope.scoped(|nested| {
-            let output_relation = implement_plan(&plan, &impl_ctx, nested, queries);
-            output_relation.tuples().distinct().leave()
-        });
-
-        // queries.insert(name.clone(), output_collection.arrange_by_self().trace);
+        let (source_handle, source) = scope.new_collection();
         
-        output_collection
-            .inspect_batch(move |_t, tuples| {
-                let out: Vec<Out> = tuples.into_iter()
-                    .map(move |x| Out(x.0.clone(), x.2))
-                    .collect();
-                
-                js! {
-                    __UGLY_DIFF_HOOK(@{&name}, @{out});
-                }
-            })
-            .probe()
+        scope.scoped(|nested| {
+
+            let mut relation_map = HashMap::new();
+            let mut result_map = HashMap::new();
+            
+            let output_relation = NamedRelation::from(&source.enter(nested));
+            let output_trace = output_relation.variable.as_ref().unwrap().leave().arrange_by_self().trace;
+            result_map.insert(name.clone(), RelationHandles { input: source_handle, trace: output_trace });
+            
+            relation_map.insert("self".to_string(), output_relation);
+
+            let execution = implement_plan(&plan, &impl_ctx, nested, queries);
+
+            relation_map
+                .get_mut("self").unwrap()
+                .add_execution(&execution.tuples());
+            
+            result_map
+        })
     })
 }
 
 fn create_inputs<'a, A: Allocate, T: Timestamp+Lattice>
-(plan: &Plan, scope: &mut Child<'a, Root<A>, T>) -> InputMap<'a, Child<'a, Root<A>, T>> {
+(plan: &Plan, scope: &mut Child<'a, Root<A>, T>) -> InputMap<Child<'a, Root<A>, T>> {
 
     match plan {
         &Plan::Project(ref plan, _) => { create_inputs(plan.deref(), scope) },
@@ -404,9 +403,9 @@ fn create_inputs<'a, A: Allocate, T: Timestamp+Lattice>
 
 fn implement_plan<'a, 'b, A: Allocate, T: Timestamp+Lattice>
     (plan: &Plan,
-     db: &ImplContext<'a, Root<A>, T>,
-     nested: &mut Child<'b, Child<'a, Root<A>, T>, T>,
-     queries: &QueryMap<T, isize>) -> SimpleRelation<Child<'b, Child<'a, Root<A>, T>, T>> {
+     db: &ImplContext<Child<'a, Root<A>, T>>,
+     nested: &mut Child<'b, Child<'a, Root<A>, T>, u64>,
+     queries: &QueryMap<T, isize>) -> SimpleRelation<'b, Child<'a, Root<A>, T>> {
         
     match plan {
         &Plan::Project(ref plan, ref symbols) => {
@@ -587,7 +586,26 @@ pub fn register(name: String, plan: Plan) -> bool {
         match CTX {
             None => false,
             Some(ref mut ctx) => {
-                let probe = implement(name, plan, ctx);
+                let mut result_map = implement(&name, plan, ctx);
+
+                // queries.insert(name.clone(), output_collection.arrange_by_self().trace);
+
+                let probe = ctx.root.dataflow(|scope| {
+                    result_map.get_mut(&name).unwrap().trace.import(scope)
+                        .as_collection(|tuple, _| tuple.clone())
+                        .consolidate()
+                        .inspect_batch(move |_t, tuples| {
+                            let out: Vec<Out> = tuples.into_iter()
+                                .map(move |x| Out(x.0.clone(), x.2))
+                                .collect();
+                            
+                            js! {
+                                __UGLY_DIFF_HOOK(@{&name}, @{out});
+                            }
+                        })
+                        .probe()
+                });
+                
                 ctx.probes.push(probe);
                 true
             }
