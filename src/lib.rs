@@ -180,7 +180,7 @@ type Arrange<G: Scope, K, V, R> = Arranged<G, K, V, R, TraceValHandle<K, V, G::T
 type ArrangeSelf<G: Scope, K, R> = Arranged<G, K, (), R, TraceKeyHandle<K, G::Timestamp, R>>;
 type InputMap<G: Scope> = HashMap<(Option<Entity>, Option<Attribute>, Option<Value>), ArrangeSelf<G, Vec<Value>, isize>>;
 type QueryMap<T, R> = HashMap<String, TraceKeyHandle<Vec<Value>, Product<RootTimestamp, T>, R>>;
-type VariableMap<'a, G> = HashMap<String, SimpleRelation<'a, G>>;
+type RelationMap<'a, G> = HashMap<String, NamedRelation<'a, G>>;
 
 //
 // CONTEXT
@@ -204,7 +204,7 @@ struct ImplContext<G: Scope + ScopeParent> where G::Timestamp : Lattice {
     input_map: InputMap<G>,
     
     // Collection variables for recursion
-    // variable_map: VariableMap<'a, G>,
+    // variable_map: RelationMap<'a, G>,
 }
 
 pub struct Context<A: Allocate, T: Timestamp+Lattice> {
@@ -231,7 +231,7 @@ pub enum Plan {
     Entity(Entity, Var, Var),
     HasAttr(Var, Attribute, Var),
     Filter(Var, Attribute, Value),
-    // Recur(Vec<Var>),
+    Recur(Vec<Var>),
 }
 
 js_serializable!(Plan);
@@ -341,12 +341,12 @@ fn implement<A: Allocate, T: Timestamp+Lattice>
             
             relation_map.insert("self".to_string(), output_relation);
 
-            let execution = implement_plan(&plan, &impl_ctx, nested, queries);
-
-            relation_map
-                .get_mut("self").unwrap()
-                .add_execution(&execution.tuples());
+            let execution = implement_plan(&plan, &impl_ctx, nested, &relation_map, queries);
             
+            relation_map
+                .get_mut(&"self".to_string()).unwrap()
+                .add_execution(&execution.tuples());
+
             result_map
         })
     })
@@ -397,7 +397,8 @@ fn create_inputs<'a, A: Allocate, T: Timestamp+Lattice>
             let mut inputs = HashMap::new();
             inputs.insert((None, Some(a), Some(v.clone())), scope.new_collection_from(vec![vec![Value::Attribute(a), v.clone()]]).1.arrange_by_self());
             inputs
-        }
+        },
+        &Plan::Recur(_) => { HashMap::new() }
     }
 }
 
@@ -405,11 +406,12 @@ fn implement_plan<'a, 'b, A: Allocate, T: Timestamp+Lattice>
     (plan: &Plan,
      db: &ImplContext<Child<'a, Root<A>, T>>,
      nested: &mut Child<'b, Child<'a, Root<A>, T>, u64>,
+     relation_map: &RelationMap<'b, Child<'a, Root<A>, T>>,
      queries: &QueryMap<T, isize>) -> SimpleRelation<'b, Child<'a, Root<A>, T>> {
         
     match plan {
         &Plan::Project(ref plan, ref symbols) => {
-            let mut relation = implement_plan(plan.deref(), db, nested, queries);
+            let mut relation = implement_plan(plan.deref(), db, nested, relation_map, queries);
             let tuples = relation
                 .tuples_by_symbols(symbols.clone())
                 .map(|(key, _tuple)| key);
@@ -419,8 +421,8 @@ fn implement_plan<'a, 'b, A: Allocate, T: Timestamp+Lattice>
         &Plan::Or(ref left_plan, ref right_plan) => {
             // @TODO can just concat more than two + a single distinct
             // @TODO or move out distinct, except for negation
-            let mut left = implement_plan(left_plan.deref(), db, nested, queries);
-            let mut right = implement_plan(right_plan.deref(), db, nested, queries);
+            let mut left = implement_plan(left_plan.deref(), db, nested, relation_map, queries);
+            let mut right = implement_plan(right_plan.deref(), db, nested, relation_map, queries);
 
             SimpleRelation {
                 // @TODO assert that both relations use the same set of symbols
@@ -431,8 +433,8 @@ fn implement_plan<'a, 'b, A: Allocate, T: Timestamp+Lattice>
             }
         },
         &Plan::Join(ref left_plan, ref right_plan, join_var) => {
-            let mut left = implement_plan(left_plan.deref(), db, nested, queries);
-            let mut right = implement_plan(right_plan.deref(), db, nested, queries);
+            let mut left = implement_plan(left_plan.deref(), db, nested, relation_map, queries);
+            let mut right = implement_plan(right_plan.deref(), db, nested, relation_map, queries);
 
             let symbols = vec![join_var];
             // @TODO correct symbols here
@@ -461,7 +463,7 @@ fn implement_plan<'a, 'b, A: Allocate, T: Timestamp+Lattice>
         &Plan::Not(ref plan) => {
             // implement_negation(plan.deref(), db)
             
-            let mut rel = implement_plan(plan.deref(), db, nested, queries);
+            let mut rel = implement_plan(plan.deref(), db, nested, relation_map, queries);
             SimpleRelation {
                 symbols: rel.symbols().clone(),
                 tuples: rel.tuples().negate()
@@ -499,9 +501,17 @@ fn implement_plan<'a, 'b, A: Allocate, T: Timestamp+Lattice>
             
             SimpleRelation { symbols: vec![sym1], tuples }
         }
-        // &Plan::Recur(syms) => {
-            
-        // }
+        &Plan::Recur(ref syms) => {
+            match relation_map.get(&"self".to_string()) {
+                None => panic!("'self' not in relation map"),
+                Some(named) => {
+                    SimpleRelation {
+                        symbols: syms.clone(),
+                        tuples: named.variable.as_ref().unwrap().deref().map(|tuple| tuple.clone()),
+                    }
+                }
+            }
+        }
     }
 }
 
