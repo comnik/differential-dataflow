@@ -267,8 +267,8 @@ impl<'a, G: Scope> Relation<'a, G> for SimpleRelation<'a, G> where G::Timestamp 
         let key_length = syms.len();
         let values_length = self.symbols().len() - key_length;
         
-        let mut key_offsets = Vec::with_capacity(key_length);
-        let mut value_offsets = Vec::with_capacity(values_length);
+        let mut key_offsets: Vec<usize> = Vec::with_capacity(key_length);
+        let mut value_offsets: Vec<usize> = Vec::with_capacity(values_length);
         let sym_set: HashSet<Var> = syms.iter().cloned().collect();
 
         // It is important to preservere the key symbols in the order
@@ -283,6 +283,13 @@ impl<'a, G: Scope> Relation<'a, G> for SimpleRelation<'a, G> where G::Timestamp 
                 value_offsets.push(idx);
             }
         }
+
+        // let debug_keys: Vec<String> = key_offsets.iter().map(|x| x.to_string()).collect();
+        // let debug_values: Vec<String> = value_offsets.iter().map(|x| x.to_string()).collect();
+        // js! {
+        //     console.log("key offsets: ", @{debug_keys});
+        //     console.log("value offsets: ", @{debug_values});
+        // }
         
         self.tuples()
             .map(move |tuple| {
@@ -460,6 +467,9 @@ fn implement_plan<'a, 'b, A: Allocate, T: Timestamp+Lattice>
             let mut right_syms: Vec<Var> = right.symbols().clone();
             right_syms.retain(|&sym| sym != join_var);
 
+            // useful for inspecting join inputs
+            //.inspect(|&((ref key, ref values), _, _)| { js! { console.log("right", @{key}, @{values}); } })
+            
             let tuples = left.tuples_by_symbols(join_vars.clone())
                 .arrange_by_key()
                 .join_core(&right.tuples_by_symbols(join_vars.clone()).arrange_by_key(), |key, v1, v2| {
@@ -474,12 +484,15 @@ fn implement_plan<'a, 'b, A: Allocate, T: Timestamp+Lattice>
                     Some(vstar)                    
                 });
 
-            let mut rel_symbols: Vec<Var> = Vec::with_capacity(left_syms.len() + right_syms.len());
-            rel_symbols.append(&mut join_vars);
-            rel_symbols.append(&mut left_syms);
-            rel_symbols.append(&mut right_syms);
+            let mut symbols: Vec<Var> = Vec::with_capacity(left_syms.len() + right_syms.len());
+            symbols.append(&mut join_vars);
+            symbols.append(&mut left_syms);
+            symbols.append(&mut right_syms);
 
-            SimpleRelation { symbols: rel_symbols, tuples }
+            // let debug_syms: Vec<String> = symbols.iter().map(|x| x.to_string()).collect();
+            // js! { console.log(@{debug_syms}); }
+
+            SimpleRelation { symbols, tuples }
         },
         &Plan::Not(ref plan) => {
             // implement_negation(plan.deref(), db)
