@@ -117,7 +117,7 @@ use stdweb::js_export;
 use std::string::String;
 use std::boxed::Box;
 use std::ops::Deref;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use timely::{Allocator};
 use timely::dataflow::{Scope, ScopeParent};
@@ -264,16 +264,32 @@ impl<'a, G: Scope> Relation<'a, G> for SimpleRelation<'a, G> where G::Timestamp 
     fn tuples(self) -> Collection<Child<'a, G, u64>, Vec<Value>, isize> { self.tuples }
 
     fn tuples_by_symbols(self, syms: Vec<Var>) -> Collection<Child<'a, G, u64>, (Vec<Value>, Vec<Value>), isize>{
-        let relation_symbols = self.symbols.clone();
+        let key_length = syms.len();
+        let values_length = self.symbols().len() - key_length;
+        
+        let mut key_offsets = Vec::with_capacity(key_length);
+        let mut value_offsets = Vec::with_capacity(values_length);
+        let sym_set: HashSet<Var> = syms.iter().cloned().collect();
+
+        // It is important to preservere the key symbols in the order
+        // they were specified.
+        for sym in syms.iter() {
+            key_offsets.push(self.symbols().iter().position(|&v| *sym == v).unwrap());
+        }
+
+        // Values we'll just take in the order they were.
+        for (idx, sym) in self.symbols().iter().enumerate() {
+            if sym_set.contains(sym) == false {
+                value_offsets.push(idx);
+            }
+        }
+        
         self.tuples()
             .map(move |tuple| {
-                let key = syms.iter()
-                    .map(|sym| {
-                        let idx = relation_symbols.iter().position(|&v| *sym == v).unwrap();
-                        tuple[idx].clone()
-                    })
-                    .collect();
-                (key, tuple)
+                let key: Vec<Value> = key_offsets.iter().map(|i| tuple[*i].clone()).collect();
+                let values: Vec<Value> = value_offsets.iter().map(|i| tuple[*i].clone()).collect();
+                
+                (key, values)
             })
     }
 }
@@ -436,28 +452,33 @@ fn implement_plan<'a, 'b, A: Allocate, T: Timestamp+Lattice>
             let mut left = implement_plan(left_plan.deref(), db, nested, relation_map, queries);
             let mut right = implement_plan(right_plan.deref(), db, nested, relation_map, queries);
 
-            let symbols = vec![join_var];
-            // @TODO correct symbols here
-            let mut left_syms = left.symbols().clone();
-            let mut right_syms = right.symbols().clone();
+            let mut join_vars = vec![join_var];
 
-            let mut rel_symbols: Vec<Var> = Vec::with_capacity(left_syms.len() + right_syms.len());
-            rel_symbols.append(&mut left_syms);
-            rel_symbols.append(&mut right_syms);
+            let mut left_syms: Vec<Var> = left.symbols().clone();
+            left_syms.retain(|&sym| sym != join_var);
+            
+            let mut right_syms: Vec<Var> = right.symbols().clone();
+            right_syms.retain(|&sym| sym != join_var);
 
-            let tuples = left.tuples_by_symbols(symbols.clone())
+            let tuples = left.tuples_by_symbols(join_vars.clone())
                 .arrange_by_key()
-                .join_core(&right.tuples_by_symbols(symbols.clone()).arrange_by_key(), |_key, v1, v2| {
+                .join_core(&right.tuples_by_symbols(join_vars.clone()).arrange_by_key(), |key, v1, v2| {
                     // @TODO can haz array here?
                     // @TODO avoid allocation, if capacity available in v1
-                    let mut vstar = Vec::with_capacity(v1.len() + v2.len());
-                    
+                    let mut vstar = Vec::with_capacity(key.len() + v1.len() + v2.len());
+
+                    vstar.append(&mut (*key).clone());
                     vstar.append(&mut (*v1).clone());
                     vstar.append(&mut (*v2).clone());
                     
                     Some(vstar)                    
                 });
-            
+
+            let mut rel_symbols: Vec<Var> = Vec::with_capacity(left_syms.len() + right_syms.len());
+            rel_symbols.append(&mut join_vars);
+            rel_symbols.append(&mut left_syms);
+            rel_symbols.append(&mut right_syms);
+
             SimpleRelation { symbols: rel_symbols, tuples }
         },
         &Plan::Not(ref plan) => {
