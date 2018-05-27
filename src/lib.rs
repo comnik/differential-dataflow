@@ -224,7 +224,7 @@ static mut CTX: Option<Context<Allocator, usize>> = None;
 #[derive(Serialize, Deserialize, Clone)]
 pub enum Plan {
     Project(Box<Plan>, Vec<Var>),
-    Or(Box<Plan>, Box<Plan>), // @TODO maybe rename Union
+    Union(Box<Plan>, Box<Plan>, Vec<Var>),
     Join(Box<Plan>, Box<Plan>, Var),
     Not(Box<Plan>),
     Lookup(Entity, Attribute, Var),
@@ -380,7 +380,7 @@ fn create_inputs<'a, A: Allocate, T: Timestamp+Lattice>
 
     match plan {
         &Plan::Project(ref plan, _) => { create_inputs(plan.deref(), scope) },
-        &Plan::Or(ref left_plan, ref right_plan) => {
+        &Plan::Union(ref left_plan, ref right_plan, _) => {
             let mut left_inputs = create_inputs(left_plan.deref(), scope);
             let mut right_inputs = create_inputs(right_plan.deref(), scope);
             
@@ -441,18 +441,33 @@ fn implement_plan<'a, 'b, A: Allocate, T: Timestamp+Lattice>
             
             SimpleRelation { symbols: symbols.to_vec(), tuples }
         },
-        &Plan::Or(ref left_plan, ref right_plan) => {
+        &Plan::Union(ref left_plan, ref right_plan, ref symbols) => {
             // @TODO can just concat more than two + a single distinct
             // @TODO or move out distinct, except for negation
             let mut left = implement_plan(left_plan.deref(), db, nested, relation_map, queries);
             let mut right = implement_plan(right_plan.deref(), db, nested, relation_map, queries);
 
+            let mut left_tuples;
+            if left.symbols() == symbols {
+               left_tuples = left.tuples();
+            } else {
+                left_tuples = left
+                    .tuples_by_symbols(symbols.clone())
+                    .map(|(key, _tuple)| key);                
+            }
+
+            let mut right_tuples;
+            if right.symbols() == symbols {
+                right_tuples = right.tuples();
+            } else {
+                right_tuples = right
+                    .tuples_by_symbols(symbols.clone())
+                    .map(|(key, _tuple)| key);
+            }
+
             SimpleRelation {
-                // @TODO assert that both relations use the same set of symbols
-                symbols: left.symbols().clone(),
-                tuples: left.tuples()
-                    .concat(&right.tuples())
-                    .distinct()
+                symbols: symbols.to_vec(),
+                tuples: left_tuples.concat(&right_tuples).distinct()
             }
         },
         &Plan::Join(ref left_plan, ref right_plan, join_var) => {
