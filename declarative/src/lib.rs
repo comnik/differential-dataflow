@@ -46,10 +46,10 @@ pub enum Value {
 }
 
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Abomonation, Debug, Serialize, Deserialize)]
-pub struct Datom(Entity, Attribute, Value);
+pub struct Datom(pub Entity, pub Attribute, pub Value);
 
-#[derive(Deserialize)]
-pub struct TxData(isize, Entity, Attribute, Value);
+#[derive(Deserialize, Debug)]
+pub struct TxData(pub isize, pub Entity, pub Attribute, pub Value);
 
 #[derive(Serialize, Debug)]
 pub struct Out(Vec<Value>, isize);
@@ -89,10 +89,10 @@ struct ImplContext<G: Scope + ScopeParent> where G::Timestamp : Lattice {
 }
 
 pub struct Context<T: Timestamp+Lattice> {
-    input_handle: InputSession<T, Datom, isize>,
-    db: DB<T>,
-    probes: Vec<ProbeHandle<T>>,
-    queries: QueryMap<T, isize>,
+    pub input_handle: InputSession<T, Datom, isize>,
+    pub db: DB<T>,
+    pub probes: Vec<ProbeHandle<T>>,
+    pub queries: QueryMap<T, isize>,
 }
 
 //
@@ -480,14 +480,6 @@ fn implement_plan<'a, 'b, A: timely::Allocate, T: Timestamp+Lattice>
 //
 // PUBLIC API
 //
-
-// Context {
-//     root,
-//     db,
-//     input_handle,
-//     probes: Vec::with_capacity(10),
-//     queries: HashMap::new(),
-// }
 
 pub fn setup_db<A: timely::Allocate, T: Timestamp+Lattice> (scope: &mut Child<Root<A>, T>) -> (InputSession<T, Datom, isize>, DB<T>) {
     let (input_handle, datoms) = scope.new_collection::<Datom, isize>();

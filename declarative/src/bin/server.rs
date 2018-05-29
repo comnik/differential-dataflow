@@ -5,7 +5,7 @@ extern crate serde_json;
 use std::io::{Write, BufRead};
 use std::sync::{Arc, Weak, Mutex};
 use std::sync::mpsc::Receiver;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::cell::RefCell;
 
@@ -19,18 +19,32 @@ use timely::dataflow::operators::Probe;
 use timely::dataflow::operators::probe::Handle as ProbeHandle;
 use timely::dataflow::operators::generic::source;
 
-use declarative_server::{Plan, setup_db, register};
+use declarative_server::{Context, Plan, TxData, Datom, setup_db, register};
 
 fn main () {
 
-    println!("Setting-up command queue");
-    
     // shared queue of commands to serialize (in the "put in an order" sense).
     let (send, recv) = std::sync::mpsc::channel();
     let recv = Arc::new(Mutex::new(recv));
     let weak = Arc::downgrade(&recv);
     
     let guards = timely::execute_from_args(std::env::args(), move |worker| {
+        // setup interpreter context
+        println!("Setting-up interpreter context");
+        let mut ctx = worker.dataflow(|scope| {
+            let (input_handle, db) = setup_db(scope);
+            
+            Context {
+                db,
+                input_handle,
+                probes: Vec::new(),
+                queries: HashMap::new(),
+            }
+        });
+
+        // setup transaction context
+        let mut next_tx: usize = 0;
+        
         let timer = ::std::time::Instant::now();
 
         // common probe used by all dataflows to express progress information.
@@ -57,16 +71,44 @@ fn main () {
                             "register" => {
                                 if command.len() > 0 {
                                     let plan_json = command.remove(0);
-                                    println!("registering {:?}", plan_json);
 
                                     match serde_json::from_str::<Plan>(&plan_json) {
                                         Err(msg) => { println!("{:?}", msg); },
                                         Ok(plan) => {
-                                            println!("parsed {:?}", plan);
+                                            worker.dataflow::<usize, _, _>(|scope| {
+                                                register(scope, &mut ctx, "test".to_string(), plan);
+                                            });
+                                            println!("Successfully registered");
                                         }
                                     }
                                 } else {
                                     println!("No plan provided");
+                                }
+                            },
+                            "transact" => {
+                                if command.len() > 0 {
+                                    let tx_data_json = command.remove(0);
+
+                                    match serde_json::from_str::<Vec<TxData>>(&tx_data_json) {
+                                        Err(msg) => { println!("{:?}", msg); },
+                                        Ok(tx_data) => {
+                                            println!("{:?}", tx_data);
+                                            for TxData(op, e, a, v) in tx_data {
+                                                ctx.input_handle.update(Datom(e, a, v), op);
+                                            }
+                                            next_tx = next_tx + 1;
+                                            ctx.input_handle.advance_to(next_tx);
+                                            ctx.input_handle.flush();
+
+                                            // for probe in &mut ctx.probes {
+                                            //     while probe.less_than(ctx.input_handle.time()) {
+                                            //         worker.step();
+                                            //     }
+                                            // }
+                                        }
+                                    }
+                                } else {
+                                    println!("No tx-data provided");
                                 }
                             },
                             _ => {
@@ -100,8 +142,9 @@ fn main () {
 
             if elts.len() > 0 {
                 match elts[0].as_str() {
-                    "help" => { println!("valid commands are currently: help, register, exit"); },
+                    "help" => { println!("valid commands are currently: help, register, transact, exit"); },
                     "register" => { send.send(elts).expect("failed to send command"); },
+                    "transact" => { send.send(elts).expect("failed to send command"); },
                     "exit" => { done = true; },
                     _ => { println!("unrecognized command: {:?}", elts[0]); },
                 }
