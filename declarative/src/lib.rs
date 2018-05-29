@@ -99,7 +99,7 @@ pub struct Context<T: Timestamp+Lattice> {
 // QUERY PLAN GRAMMAR
 //
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Plan {
     Project(Box<Plan>, Vec<Var>),
     Union(Box<Plan>, Box<Plan>, Vec<Var>),
