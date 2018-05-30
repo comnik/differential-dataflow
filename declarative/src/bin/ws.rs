@@ -1,9 +1,9 @@
 extern crate timely;
 extern crate declarative_server;
 extern crate serde_json;
+extern crate ws;
 
-use std::io::{Write, Read, BufRead, BufReader};
-use std::net::{TcpListener};
+use std::io::{Write, BufRead};
 use std::sync::{Arc, Weak, Mutex};
 use std::sync::mpsc::Receiver;
 use std::collections::{HashMap, VecDeque};
@@ -20,7 +20,11 @@ use timely::dataflow::operators::Probe;
 use timely::dataflow::operators::probe::Handle as ProbeHandle;
 use timely::dataflow::operators::generic::source;
 
+use ws::{Message, CloseCode};
+
 use declarative_server::{Context, Plan, TxData, Datom, setup_db, register};
+
+enum Interface { CLI, WS, }
 
 fn main () {
 
@@ -28,6 +32,19 @@ fn main () {
     let (send, recv) = std::sync::mpsc::channel();
     let recv = Arc::new(Mutex::new(recv));
     let weak = Arc::downgrade(&recv);
+
+    let args: Vec<String> = std::env::args().collect();
+
+    let interface: Interface = match args.get(1) {
+        None => Interface::CLI,
+        Some(name) => {
+            match name.as_ref() {
+                "CLI" => Interface::CLI,
+                "WS" => Interface::WS,
+                _ => panic!("Unknown interface {}", name)
+            }
+        }
+    };
     
     let guards = timely::execute_from_args(std::env::args(), move |worker| {
         // setup interpreter context
@@ -129,47 +146,69 @@ fn main () {
 
         println!("worker {}: command queue unavailable; exiting command loop.", worker.index());
     });
-        
+
     std::io::stdout().flush().unwrap();
 
-    let listener = TcpListener::bind("127.0.0.1:6262").unwrap();
-    listener.set_nonblocking(false).expect("Cannot set blocking");
-    
-    println!("Running on port 6262");
+    match interface {
+        Interface::CLI => {
+            let input = std::io::stdin();
+            let mut done = false;
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut sin) => {
-                println!("Accepted connection");
+            while !done {
+                if let Some(line) = input.lock().lines().map(|x| x.unwrap()).next() {
+                    let elts: Vec<_> = line.split('?').map(|x| x.to_owned()).collect();
 
-                let mut reader = BufReader::new(sin);
-                for input in reader.lines() {
-                    match input {
-                        Err(e) => { println!("Error reading line {}", e); break; },
-                        Ok(line) => {
+                    if elts.len() > 0 {
+                        match elts[0].as_str() {
+                            "help" => { println!("valid commands are currently: help, register, transact, exit"); },
+                            "register" => { send.send(elts).expect("failed to send command"); },
+                            "transact" => { send.send(elts).expect("failed to send command"); },
+                            "exit" => { done = true; },
+                            _ => { println!("unrecognized command: {:?}", elts[0]); },
+                        }
+                    }
+
+                    std::io::stdout().flush().unwrap();
+                }
+            }
+
+            drop(send);
+        },
+        Interface::WS => {
+            let send_handle = &send;
+            
+            ws::listen("127.0.0.1:6262", |out| {
+                move |msg| {
+                    match msg {
+                        Message::Text(line) => {
                             let elts: Vec<_> = line.split('?').map(|x| x.to_owned()).collect();
 
                             if elts.len() > 0 {
                                 match elts[0].as_str() {
-                                    "help" => { println!("valid commands are currently: help, register, transact, exit"); },
-                                    "register" => { send.send(elts).expect("failed to send command"); },
-                                    "transact" => { send.send(elts).expect("failed to send command"); },
-                                    "exit" => { break; },
-                                    _ => { println!("unrecognized command: {:?}", elts[0]); },
+                                    "help" => { out.send("valid commands are currently: help, register, transact, exit") },
+                                    "register" => {
+                                        send_handle.send(elts).expect("failed to send command");
+                                        out.send("Ok")
+                                    },
+                                    "transact" => {
+                                        send_handle.send(elts).expect("failed to send command");
+                                        out.send("Ok")
+                                    },
+                                    "exit" => { out.close(CloseCode::Normal) },
+                                    _ => { out.send("unrecognized command") },
                                 }
+                            } else {
+                                out.send("malformed message")
                             }
-                        }
+                        },
+                        Message::Binary(_) => { out.send("Server only accepts string messages.") },
                     }
                 }
-
-                println!("Closing connection");
-            },
-            Err(e) => { println!("Encountered I/O error: {}", e); }
+            }).unwrap();
         }
-    }
-
+    };
+    
     println!("main: exited command loop");
-    drop(send);
     drop(recv);
 
     guards.unwrap();

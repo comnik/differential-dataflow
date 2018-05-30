@@ -517,6 +517,8 @@ pub fn register<A: timely::Allocate, T: Timestamp+Lattice> (scope: &mut Child<Ro
     true
 }
 
+// @TODO this is probably only neccessary in the WASM interface
+//
 // pub fn transact<A: Allocate>(ctx: &mut Context<A, usize>, tx: usize, d: Vec<TxData>) -> bool {
 //     for TxData(op, e, a, v) in d {
 //         ctx.input_handle.update(Datom(e, a, v), op);
