@@ -3,12 +3,13 @@ extern crate declarative_server;
 extern crate serde_json;
 extern crate ws;
 
-use std::io::{Write, BufRead};
+use std::io::{Write, BufRead, BufReader};
 use std::sync::{Arc, Weak, Mutex};
 use std::sync::mpsc::Receiver;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::cell::RefCell;
+use std::fs::File;
 
 use timely::PartialOrder;
 use timely::progress::timestamp::RootTimestamp;
@@ -22,25 +23,26 @@ use timely::dataflow::operators::generic::source;
 
 use ws::{Message, CloseCode};
 
-use declarative_server::{Context, Plan, TxData, Datom, setup_db, register};
+use declarative_server::{Context, Plan, TxData, Datom, Attribute, Value, setup_db, register};
+
+const ATTR_NODE: Attribute = 100;
+const ATTR_EDGE: Attribute = 200;
 
 enum Interface { CLI, WS, }
 
 fn main () {
-
+    
     // shared queue of commands to serialize (in the "put in an order" sense).
     let (send, recv) = std::sync::mpsc::channel();
     let recv = Arc::new(Mutex::new(recv));
     let weak = Arc::downgrade(&recv);
 
-    let args: Vec<String> = std::env::args().collect();
-
-    let interface: Interface = match args.get(1) {
+    let interface: Interface = match std::env::args().nth(1) {
         None => Interface::CLI,
         Some(name) => {
             match name.as_ref() {
-                "CLI" => Interface::CLI,
-                "WS" => Interface::WS,
+                "cli" => Interface::CLI,
+                "ws" => Interface::WS,
                 _ => panic!("Unknown interface {}", name)
             }
         }
@@ -64,7 +66,7 @@ fn main () {
         let mut next_tx: usize = 0;
         
         let timer = ::std::time::Instant::now();
-
+        
         // common probe used by all dataflows to express progress information.
         let mut probe = timely::dataflow::operators::probe::Handle::new();
         
@@ -96,7 +98,6 @@ fn main () {
                                             worker.dataflow::<usize, _, _>(|scope| {
                                                 register(scope, &mut ctx, "test".to_string(), plan);
                                             });
-                                            println!("Successfully registered");
                                         }
                                     }
                                 } else {
@@ -129,6 +130,46 @@ fn main () {
                                     println!("No tx-data provided");
                                 }
                             },
+                            "load_data" => {
+                                if command.len() > 0 {
+                                    let filename = command.remove(0);
+                                    let file = BufReader::new(File::open(filename).unwrap());
+                                    let peers = worker.peers();
+
+                                    let max_lines: usize = command.remove(0).parse().unwrap();
+                                    let mut line_count: usize = 0;
+                                    
+                                    for readline in file.lines() {
+                                        let line = readline.ok().expect("read error");
+
+                                        if line_count > max_lines { break; };
+                                        line_count += 1;
+                                        
+                                        if !line.starts_with('#') && line.len() > 0 {
+                                            let mut elts = line[..].split_whitespace();
+                                            let src: u64 = elts.next().unwrap().parse().ok().expect("malformed src");
+                                            
+                                            if (src as usize) % peers == index {
+                                                let dst: u64 = elts.next().unwrap().parse().ok().expect("malformed dst");
+                                                let typ: &str = elts.next().unwrap();
+                                                match typ {
+                                                    "n" => { ctx.input_handle.update(Datom(src, ATTR_NODE, Value::Eid(dst)), 1); },
+                                                    "e" => { ctx.input_handle.update(Datom(src, ATTR_EDGE, Value::Eid(dst)), 1); },
+                                                    unk => { panic!("unknown type: {}", unk)},
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    next_tx = next_tx + 1;
+                                    ctx.input_handle.advance_to(next_tx);
+                                    ctx.input_handle.flush();
+
+                                    if index == 0 { println!("{:?}:\tData loaded", timer.elapsed()); }
+                                } else {
+                                    println!("No filename provided");
+                                }
+                            },
                             _ => {
                                 println!("worker {:?}: unrecognized command: {:?}", index, operation);
                             }
@@ -148,7 +189,7 @@ fn main () {
     });
 
     std::io::stdout().flush().unwrap();
-
+    
     match interface {
         Interface::CLI => {
             let input = std::io::stdin();
@@ -160,9 +201,10 @@ fn main () {
 
                     if elts.len() > 0 {
                         match elts[0].as_str() {
-                            "help" => { println!("valid commands are currently: help, register, transact, exit"); },
+                            "help" => { println!("valid commands are currently: help, register, transact, load_data, exit"); },
                             "register" => { send.send(elts).expect("failed to send command"); },
                             "transact" => { send.send(elts).expect("failed to send command"); },
+                            "load_data" => { send.send(elts).expect("failed to send command"); },
                             "exit" => { done = true; },
                             _ => { println!("unrecognized command: {:?}", elts[0]); },
                         }

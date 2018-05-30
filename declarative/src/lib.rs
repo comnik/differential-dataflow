@@ -34,8 +34,8 @@ use differential_dataflow::operators::consolidate::Consolidate;
 // TYPES
 //
 
-type Entity = u64;
-type Attribute = u32;
+pub type Entity = u64;
+pub type Attribute = u32;
 
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Abomonation, Debug, Serialize, Deserialize)]
 pub enum Value {
