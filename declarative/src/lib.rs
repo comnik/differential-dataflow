@@ -167,6 +167,7 @@ impl<'a, G: Scope> Relation<'a, G> for SimpleRelation<'a, G> where G::Timestamp 
         self.tuples()
             .map(move |tuple| {
                 let key: Vec<Value> = key_offsets.iter().map(|i| tuple[*i].clone()).collect();
+                // @TODO second clone not really neccessary
                 let values: Vec<Value> = value_offsets.iter().map(|i| tuple[*i].clone()).collect();
                 
                 (key, values)
@@ -363,9 +364,9 @@ fn implement_plan<'a, 'b, A: timely::Allocate, T: Timestamp+Lattice>
                     // @TODO avoid allocation, if capacity available in v1
                     let mut vstar = Vec::with_capacity(key.len() + v1.len() + v2.len());
 
-                    vstar.append(&mut (*key).clone());
-                    vstar.append(&mut (*v1).clone());
-                    vstar.append(&mut (*v2).clone());
+                    vstar.extend(key.iter().cloned());
+                    vstar.extend(v1.iter().cloned());
+                    vstar.extend(v2.iter().cloned());
                     
                     Some(vstar)                    
                 });
