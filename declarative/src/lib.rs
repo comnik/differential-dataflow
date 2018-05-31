@@ -500,16 +500,18 @@ pub fn register<A: timely::Allocate, T: Timestamp+Lattice> (scope: &mut Child<Ro
     // queries.insert(name.clone(), output_collection.arrange_by_self().trace);
 
     let probe = result_map.get_mut(&name).unwrap().trace.import(scope)
-        .as_collection(|tuple, _| tuple.clone())
+    // .as_collection(|tuple, _| tuple.clone())
+        .as_collection(|_,_| ())
         .consolidate()
-        .inspect_batch(move |_t, tuples| {
-            let out: Vec<Out> = tuples.into_iter()
-                .map(move |x| Out(x.0.clone(), x.2))
-                .collect();
+        .inspect(|x| println!("outputs: {:?}", x.2))
+        // .inspect_batch(move |_t, tuples| {
+        //     let out: Vec<Out> = tuples.into_iter()
+        //         .map(move |x| Out(x.0.clone(), x.2))
+        //         .collect();
 
-            // @TODO how to output?
-            println!("<= {:?} {:?}", &name, out);
-        })
+        //     // @TODO how to output?
+        //     println!("<= {:?} {:?}", &name, out);
+        // })
         .probe();
     
     ctx.probes.push(probe);
