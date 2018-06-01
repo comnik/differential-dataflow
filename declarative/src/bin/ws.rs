@@ -1,4 +1,5 @@
 extern crate timely;
+extern crate differential_dataflow;
 extern crate declarative_server;
 extern crate serde_json;
 extern crate ws;
@@ -20,6 +21,8 @@ use timely::dataflow::channels::pact::Exchange;
 use timely::dataflow::operators::Probe;
 use timely::dataflow::operators::probe::Handle as ProbeHandle;
 use timely::dataflow::operators::generic::source;
+
+use differential_dataflow::operators::consolidate::Consolidate;
 
 use ws::{Message, CloseCode};
 
@@ -96,7 +99,23 @@ fn main () {
                                         Err(msg) => { println!("{:?}", msg); },
                                         Ok(plan) => {
                                             worker.dataflow::<usize, _, _>(|scope| {
-                                                register(scope, &mut ctx, "test".to_string(), plan);
+                                                let mut rel_map = register(scope, &mut ctx, "test".to_string(), plan);
+                                                let probe = rel_map.get_mut("test").unwrap().trace.import(scope)
+                                                // .as_collection(|tuple, _| tuple.clone())
+                                                    .as_collection(|_,_| ())
+                                                    .consolidate()
+                                                    .inspect(move |x| println!("Nodes: {:?} (at {:?})", x.2, ::std::time::Instant::now()))
+                                                // .inspect_batch(move |_t, tuples| {
+                                                //     let out: Vec<Out> = tuples.into_iter()
+                                                //         .map(move |x| Out(x.0.clone(), x.2))
+                                                //         .collect();
+
+                                                //     // @TODO how to output?
+                                                //     println!("<= {:?} {:?}", &name, out);
+                                                // })
+                                                    .probe();
+
+                                                ctx.probes.push(probe);
                                             });
                                         }
                                     }
@@ -118,12 +137,6 @@ fn main () {
                                             next_tx = next_tx + 1;
                                             ctx.input_handle.advance_to(next_tx);
                                             ctx.input_handle.flush();
-
-                                            // for probe in &mut ctx.probes {
-                                            //     while probe.less_than(ctx.input_handle.time()) {
-                                            //         worker.step();
-                                            //     }
-                                            // }
                                         }
                                     }
                                 } else {
@@ -132,6 +145,8 @@ fn main () {
                             },
                             "load_data" => {
                                 if command.len() > 0 {
+                                    let load_timer = ::std::time::Instant::now();
+                                    
                                     let filename = command.remove(0);
                                     let file = BufReader::new(File::open(filename).unwrap());
                                     let peers = worker.peers();
@@ -161,11 +176,15 @@ fn main () {
                                         }
                                     }
 
+                                    if index == 0 {
+                                        println!("{:?}:\tData loaded", load_timer.elapsed());
+                                        println!("{:?}", ::std::time::Instant::now());
+                                    }
+                                    
                                     next_tx = next_tx + 1;
                                     ctx.input_handle.advance_to(next_tx);
                                     ctx.input_handle.flush();
 
-                                    if index == 0 { println!("{:?}:\tData loaded", timer.elapsed()); }
                                 } else {
                                     println!("No filename provided");
                                 }
@@ -178,11 +197,15 @@ fn main () {
                 }
             }
 
-            // arguably we should pick a time (now) and `step_while` until it has passed. 
-            // this should ensure that we actually fully drain ranges of updates, rather
-            // than providing no guaranteed progress for e.g. iterative computations.
+            // @FRANK does the below make sense?
 
             worker.step();
+
+            for probe in &mut ctx.probes {
+                while probe.less_than(ctx.input_handle.time()) {
+                    worker.step();
+                }
+            }
         }
 
         println!("worker {}: command queue unavailable; exiting command loop.", worker.index());

@@ -28,7 +28,6 @@ use differential_dataflow::operators::arrange::{ArrangeByKey, ArrangeBySelf, Tra
 use differential_dataflow::operators::group::Threshold;
 use differential_dataflow::operators::join::{JoinCore};
 use differential_dataflow::operators::iterate::Variable;
-use differential_dataflow::operators::consolidate::Consolidate;
 
 //
 // TYPES
@@ -124,9 +123,9 @@ trait Relation<'a, G: Scope> where G::Timestamp : Lattice {
     fn tuples_by_symbols(self, syms: Vec<Var>) -> Collection<Child<'a, G, u64>, (Vec<Value>, Vec<Value>), isize>;
 }
 
-struct RelationHandles<T: Timestamp+Lattice> {
-    input: InputSession<T, Vec<Value>, isize>,
-    trace: TraceKeyHandle<Vec<Value>, Product<RootTimestamp, T>, isize>,
+pub struct RelationHandles<T: Timestamp+Lattice> {
+    pub input: InputSession<T, Vec<Value>, isize>,
+    pub trace: TraceKeyHandle<Vec<Value>, Product<RootTimestamp, T>, isize>,
 }
 
 struct SimpleRelation<'a, G: Scope> where G::Timestamp : Lattice {
@@ -494,30 +493,15 @@ pub fn setup_db<A: timely::Allocate, T: Timestamp+Lattice> (scope: &mut Child<Ro
     (input_handle, db)
 }
 
-pub fn register<A: timely::Allocate, T: Timestamp+Lattice> (scope: &mut Child<Root<A>, T>, ctx: &mut Context<T>, name: String, plan: Plan) -> bool {
+pub fn register<A: timely::Allocate, T: Timestamp+Lattice>
+(scope: &mut Child<Root<A>, T>, ctx: &mut Context<T>, name: String, plan: Plan) -> HashMap<String, RelationHandles<T>> {
     
     let mut result_map = implement(&name, plan, scope, ctx);
 
+    // @TODO store trace somewhere for re-use from other queries later
     // queries.insert(name.clone(), output_collection.arrange_by_self().trace);
-
-    let probe = result_map.get_mut(&name).unwrap().trace.import(scope)
-    // .as_collection(|tuple, _| tuple.clone())
-        .as_collection(|_,_| ())
-        .consolidate()
-        .inspect(|x| println!("outputs: {:?}", x.2))
-        // .inspect_batch(move |_t, tuples| {
-        //     let out: Vec<Out> = tuples.into_iter()
-        //         .map(move |x| Out(x.0.clone(), x.2))
-        //         .collect();
-
-        //     // @TODO how to output?
-        //     println!("<= {:?} {:?}", &name, out);
-        // })
-        .probe();
     
-    ctx.probes.push(probe);
-    
-    true
+    result_map
 }
 
 // @TODO this is probably only neccessary in the WASM interface
